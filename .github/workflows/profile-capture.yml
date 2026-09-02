@@ -52,10 +52,7 @@ jobs:
           # `timeout` bounds wall-clock so load outlives the capture window
           # (15s steady-state wait + 100s capture = 115s). `--msgs` is high
           # enough that neither side exits on its own before `timeout` stops it.
-          # `--clients 24` (up from 8) and `--size 512` (up from 256) push more
-          # concurrent CPU-bound work per SIGPROF tick, raising samples/sec so
-          # a 100s window (pgoctl's collect step times out client-side above
-          # ~120s regardless of --window) still yields close to 10k samples.
+          # Testing with a 100s capture window.
           timeout 130s nats bench sub pgo-bench --clients 24 --msgs 1000000000 >/dev/null 2>&1 &
           sleep 1
           timeout 125s nats bench pub pgo-bench --clients 24 --size 512 --msgs 1000000000 >/dev/null 2>&1 &
