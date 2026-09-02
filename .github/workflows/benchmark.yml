@@ -1,0 +1,58 @@
+name: PGO Benchmark Comparison
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Verify committed PGO profile is present
+        run: |
+          test -f default.pgo || {
+            echo "::error::default.pgo not found at repo root. Commit the captured profile (default-pgo artifact from PGO Profile Capture) before running this comparison."
+            exit 1
+          }
+
+      - name: Baseline benchmarks (no PGO)
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark(_+PubSub$|_+PubSubTwoConns|_+Pub128B_Payload|_+PubTwoQueueSub)' \
+            -benchmem -count=10 -pgo=off ./test/ | tee baseline.txt
+
+      - name: PGO benchmarks
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark(_+PubSub$|_+PubSubTwoConns|_+Pub128B_Payload|_+PubTwoQueueSub)' \
+            -benchmem -count=10 -pgo="$GITHUB_WORKSPACE/default.pgo" ./test/ | tee pgo.txt
+
+      - name: benchstat comparison
+        run: |
+          benchstat baseline.txt pgo.txt | tee benchstat.txt
+          {
+            echo '### PGO benchstat (no-PGO vs. PGO)';
+            echo '```';
+            cat benchstat.txt;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          if-no-files-found: warn
+          path: |
+            baseline.txt
+            pgo.txt
+            benchstat.txt
