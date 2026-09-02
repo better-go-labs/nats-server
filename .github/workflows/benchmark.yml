@@ -2,9 +2,6 @@ name: PGO Benchmark Comparison
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
 
 jobs:
   benchmark:
@@ -38,7 +35,7 @@ jobs:
           ulimit -n 8192
           go test -run=^$ \
             -bench='Benchmark(_+PubSub$|_+PubSubTwoConns|_+Pub128B_Payload|_+PubTwoQueueSub)' \
-            -benchmem -count=10 -pgo="$GITHUB_WORKSPACE/default.pgo" ./test/ | tee pgo.txt
+            -benchmem -count=10 -pgo=\"$GITHUB_WORKSPACE/default.pgo\" ./test/ | tee pgo.txt
 
       - name: benchstat comparison
         run: |
