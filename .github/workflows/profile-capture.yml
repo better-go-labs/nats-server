@@ -53,9 +53,9 @@ jobs:
           # (15s steady-state wait + 1600s capture = 1615s). `--msgs` is high
           # enough that neither side exits on its own before `timeout` stops it.
           # Testing with a 1600s capture window.
-          nohup timeout 1680s nats bench sub pgo-bench --clients 48 --msgs 4000000000 >/dev/null 2>&1 &
+          timeout 1630s nats bench sub pgo-bench --clients 48 --msgs 4000000000 >/dev/null 2>&1 &
           sleep 1
-          nohup timeout 1680s nats bench pub pgo-bench --clients 48 --size 512 --msgs 4000000000 >/dev/null 2>&1 &
+          timeout 1625s nats bench pub pgo-bench --clients 48 --size 512 --msgs 4000000000 >/dev/null 2>&1 &
           echo "load generators started"
 
       - name: Wait for steady state
