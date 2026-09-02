@@ -62,9 +62,9 @@ jobs:
         run: sleep 15
 
       - name: Capture PGO profile
-        uses: better-go-labs/pgoctl@v1.0.2
+        uses: better-go-labs/pgoctl@v0.1.2
         with:
-          pgoctl-version: v1.0.2
+          pgoctl-version: v0.1.2
           pprof-url: http://localhost:6060
           duration: '400'
           artifact-name: default-pgo
