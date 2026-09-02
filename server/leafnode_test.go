@@ -22,7 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +41,7 @@ import (
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 
+	"github.com/nats-io/nats-server/v2/internal/fastrand"
 	"github.com/nats-io/nats-server/v2/internal/testhelper"
 )
 
@@ -648,6 +649,7 @@ func TestLeafNodeBasicAuthSingleton(t *testing.T) {
 		{"user creds required so binds to ACC1", "user: \"ln\"\npass: \"pwd\"", "ln:pwd@", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+
 			conf := createConfFile(t, []byte(fmt.Sprintf(template, test.userSpec)))
 			s1, o1 := RunServerWithConfig(conf)
 			defer s1.Shutdown()
@@ -2649,6 +2651,7 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+
 			conf := createConfFile(t, []byte(fmt.Sprintf(configTmpl, ojwt, sysAccPk, tmpDir, c.cfg)))
 			opts := LoadConfig(conf)
 			s, err := NewServer(opts)
@@ -3215,8 +3218,8 @@ func TestLeafNodeWSFailedConnection(t *testing.T) {
 			if err != nil {
 				return
 			}
-			time.Sleep(time.Duration(rand.Uint32N(100)) * time.Millisecond)
-			if rand.Uint32N(2) == 1 {
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+			if rand.Intn(2) == 1 {
 				c.Write([]byte("something\r\n"))
 			}
 			c.Close()
@@ -4525,7 +4528,7 @@ func TestLeafNodeQueueGroupDistributionWithDaisyChainAndGateway(t *testing.T) {
 	send := func(t *testing.T, subj string) {
 		for i := 0; i < total; i++ {
 			var nc *nats.Conn
-			if rand.Uint32N(2) == 0 {
+			if fastrand.Uint32n(2) == 0 {
 				nc = ncB1
 			} else {
 				nc = ncB2
@@ -5383,6 +5386,7 @@ func TestLeafNodeQueueGroupWeightCorrectOnConnectionCloseInSuperCluster(t *testi
 }
 
 func TestLeafNodeQueueInterestAndWeightCorrectAfterServerRestartOrConnectionClose(t *testing.T) {
+
 	// Note that this is not what a normal configuration should be. Users should
 	// configure each leafnode to have the URLs of both B1 and B2 so that when
 	// a server fails, the leaf can reconnect to the other running server. But
@@ -6791,6 +6795,7 @@ func TestLeafNodeDuplicateMsg(t *testing.T) {
 	checkLeafNodeConnectedCount(t, b2, 2)
 
 	check := func(t *testing.T, subSrv *Server, pubSrv *Server) {
+
 		sc := natsConnect(t, subSrv.ClientURL(), nats.UserInfo("userb", "userb"))
 		defer sc.Close()
 
@@ -7398,9 +7403,9 @@ func TestLeafNodeCompression(t *testing.T) {
 	totalPayloadSize := 0
 	count := 26
 	for i := 0; i < count; i++ {
-		n := rand.Uint32N(2048) + 1
+		n := rand.Intn(2048) + 1
 		p := make([]byte, n)
-		for j := uint32(0); j < n; j++ {
+		for j := 0; j < n; j++ {
 			p[j] = byte(i) + 'A'
 		}
 		totalPayloadSize += len(p)
@@ -8327,7 +8332,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 	defer sc.shutdown()
 
 	// Now create a leafnode cluster that has 2 LNs, one to each cluster but on separate accounts, ONE and TWO.
-	lnTmpl := `
+	var lnTmpl = `
 		listen: 127.0.0.1:-1
 		server_name: %s
 		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
@@ -8343,7 +8348,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }}
 		`
 
-	leafFrag := `
+	var leafFrag = `
 		leaf {
 			listen: 127.0.0.1:-1
 			remotes [
@@ -8406,7 +8411,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 
 	createSubs := func(num int, conns []*nats.Conn) (subs []*nats.Subscription) {
 		for i := 0; i < num; i++ {
-			nc := conns[rand.IntN(len(conns))]
+			nc := conns[rand.Intn(len(conns))]
 			sub, err := nc.QueueSubscribeSync("REQUEST", "MC")
 			require_NoError(t, err)
 			subs = append(subs, sub)
@@ -8504,13 +8509,13 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 	// These subs slightly different.
 	var r1, r2 atomic.Uint64
 	for i := 0; i < 20; i++ {
-		nc := c1c[rand.IntN(len(c1c))]
+		nc := c1c[rand.Intn(len(c1c))]
 		sub, err := nc.QueueSubscribe("REQUEST", "MC", func(m *nats.Msg) { r1.Add(1) })
 		require_NoError(t, err)
 		subs1 = append(subs1, sub)
 		nc.Flush()
 
-		nc = c2c[rand.IntN(len(c2c))]
+		nc = c2c[rand.Intn(len(c2c))]
 		sub, err = nc.QueueSubscribe("REQUEST", "MC", func(m *nats.Msg) { r2.Add(1) })
 		require_NoError(t, err)
 		subs2 = append(subs2, sub)
@@ -8527,7 +8532,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 		// Check if we have more to simulate draining.
 		// Will drain within first ~100 requests using 20% rand test below.
 		// Will leave 1 behind.
-		if dindex < len(subs1)-1 && rand.IntN(6) > 4 {
+		if dindex < len(subs1)-1 && rand.Intn(6) > 4 {
 			sub := subs1[dindex]
 			dindex++
 			sub.Drain()
@@ -8546,7 +8551,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts(t *tes
 }
 
 func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t *testing.T) {
-	tmpl := `
+	var tmpl = `
 	listen: 127.0.0.1:-1
 
 	server_name: %s
@@ -8587,7 +8592,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 	defer sc.shutdown()
 
 	// Now create a leafnode cluster that has 2 LNs, one to each cluster but on separate accounts, STL and KSC.
-	lnTmpl := `
+	var lnTmpl = `
 		listen: 127.0.0.1:-1
 		server_name: %s
 		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
@@ -8603,7 +8608,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }}
 		`
 
-	leafFrag := `
+	var leafFrag = `
 		leaf {
 			listen: 127.0.0.1:-1
 			remotes [
@@ -8667,7 +8672,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 
 	createSubs := func(num int, conns []*nats.Conn) (subs []*nats.Subscription) {
 		for i := 0; i < num; i++ {
-			nc := conns[rand.IntN(len(conns))]
+			nc := conns[rand.Intn(len(conns))]
 			sub, err := nc.QueueSubscribeSync("REQUEST", "MC")
 			require_NoError(t, err)
 			subs = append(subs, sub)
@@ -8778,13 +8783,13 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 	// These subs slightly different.
 	var r1, r2 atomic.Uint64
 	for i := 0; i < 20; i++ {
-		nc := c1c[rand.IntN(len(c1c))]
+		nc := c1c[rand.Intn(len(c1c))]
 		sub, err := nc.QueueSubscribe("REQUEST", "MC", func(m *nats.Msg) { r1.Add(1) })
 		require_NoError(t, err)
 		subs1 = append(subs1, sub)
 		nc.Flush()
 
-		nc = c2c[rand.IntN(len(c2c))]
+		nc = c2c[rand.Intn(len(c2c))]
 		sub, err = nc.QueueSubscribe("REQUEST", "MC", func(m *nats.Msg) { r2.Add(1) })
 		require_NoError(t, err)
 		subs2 = append(subs2, sub)
@@ -8803,7 +8808,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 		// Check if we have more to simulate draining.
 		// Will drain within first ~100 requests using 20% rand test below.
 		// Will leave 1 behind.
-		if dindex < len(subs1)-1 && rand.IntN(6) > 4 {
+		if dindex < len(subs1)-1 && rand.Intn(6) > 4 {
 			sub := subs1[dindex]
 			dindex++
 			sub.Drain()
@@ -8866,7 +8871,7 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 }
 
 func TestLeafNodeWithWeightedDQResponsesWithStreamImportAccountsWithUnsub(t *testing.T) {
-	tmpl := `
+	var tmpl = `
 	listen: 127.0.0.1:-1
 
 	server_name: %s
@@ -8901,7 +8906,7 @@ func TestLeafNodeWithWeightedDQResponsesWithStreamImportAccountsWithUnsub(t *tes
 	defer c.shutdown()
 
 	// Now create a leafnode cluster that has 2 LNs, one to each cluster but on separate accounts, STL and KSC.
-	lnTmpl := `
+	var lnTmpl = `
 		listen: 127.0.0.1:-1
 		server_name: %s
 		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
@@ -8917,7 +8922,7 @@ func TestLeafNodeWithWeightedDQResponsesWithStreamImportAccountsWithUnsub(t *tes
 		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }}
 		`
 
-	leafFrag := `
+	var leafFrag = `
 		leaf {
 			listen: 127.0.0.1:-1
 			remotes [ { urls: [ %s ] } ]
@@ -10127,7 +10132,7 @@ func TestLeafNodeBannerNoClusterNameIfNoCluster(t *testing.T) {
 }
 
 func TestLeafNodeCredFormatting(t *testing.T) {
-	// create the operator/sys/account tree
+	//create the operator/sys/account tree
 	oKP, err := nkeys.CreateOperator()
 	require_NoError(t, err)
 	oPK, err := oKP.PublicKey()
@@ -12039,8 +12044,7 @@ func TestLeafNodeDaisyChainWithAccountImportExport(t *testing.T) {
 				Name: "leaf-sh",
 				External: &nats.ExternalStream{
 					APIPrefix:     "$JS.leaf-sh.API",
-					DeliverPrefix: "sync.leaf-sh.jspush",
-				},
+					DeliverPrefix: "sync.leaf-sh.jspush"},
 			},
 		},
 	}

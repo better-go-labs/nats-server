@@ -277,8 +277,6 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// Open clients
 	var openClients []*client
-	// Selected client
-	var cidClient *client
 	// Hold for closed clients if requested.
 	var closedClients []*closedClient
 
@@ -300,7 +298,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		a.mu.RUnlock()
 	}
 
-	// Snapshot server connection state.
+	// Walk the open client list with server lock held.
 	s.mu.RLock()
 	// Default to all client unless filled in above.
 	if clist == nil {
@@ -311,11 +309,6 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// copy the server id for monitoring
 	c.ID = s.info.ID
-	// select client by CID
-	if cid > 0 {
-		cidClient = s.clients[cid]
-	}
-	s.mu.RUnlock()
 
 	// Number of total clients. The resulting ConnInfo array
 	// may be smaller if pagination is used.
@@ -372,8 +365,8 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		// Let's first check if user also selects on ConnOpen or ConnAll
 		// and look for opened connections.
 		if state == ConnOpen || state == ConnAll {
-			if cidClient != nil {
-				openClients = append(openClients, cidClient)
+			if client := s.clients[cid]; client != nil {
+				openClients = append(openClients, client)
 				closedClients = nil
 			}
 		}
@@ -419,6 +412,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 			}
 		}
 	}
+	s.mu.RUnlock()
 
 	// Filter by subject now if needed. We do this outside of server lock.
 	if filter != _EMPTY_ {

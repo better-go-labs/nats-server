@@ -1,0 +1,71 @@
+name: PGO Profile Capture
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install nats CLI (pinned)
+        run: |
+          # Pin the version: `@latest` changes bench subcommand syntax between
+          # releases, which is what caused the earlier iteration churn.
+          curl -sf https://binaries.nats.dev/nats-io/natscli/nats@v0.2.4 | sh
+          sudo mv nats /usr/local/bin/nats
+          nats --version
+
+      - name: Build nats-server
+        run: go build -o nats-server .
+
+      - name: Start nats-server with pprof enabled
+        run: |
+          nohup ./nats-server --jetstream --profile 6060 > nats-server.log 2>&1 &
+          echo "nats-server started (pid $!)"
+
+      - name: Wait for pprof endpoint to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:6060/debug/pprof/ >/dev/null; then
+              echo "pprof ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "pprof endpoint did not come up"; cat nats-server.log; exit 1
+
+      - name: Start sustained load
+        run: |
+          set -x
+          # `timeout` bounds wall-clock so load outlives the capture window
+          # (15s steady-state wait + 30s capture = 45s). `--msgs` is high enough
+          # that neither side exits on its own before `timeout` stops it.
+          timeout 60s nats bench sub pgo-bench --clients 8 --msgs 1000000000 >/dev/null 2>&1 &
+          sleep 1
+          timeout 55s nats bench pub pgo-bench --clients 8 --size 256 --msgs 1000000000 >/dev/null 2>&1 &
+          echo "load generators started"
+
+      - name: Wait for steady state
+        run: sleep 15
+
+      - name: Capture PGO profile
+        uses: better-go-labs/pgoctl@v0.1.1
+        with:
+          pgoctl-version: v0.1.1
+          pprof-url: http://localhost:6060
+          duration: '30'
+          artifact-name: default-pgo
+          upload-artifact: 'true'
+          comment-on-pr: 'true'

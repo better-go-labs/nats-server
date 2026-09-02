@@ -255,7 +255,7 @@ func TestNoRaceClosedSlowConsumerWriteDeadline(t *testing.T) {
 
 	// At this point server should have closed connection c.
 	checkClosedConns(t, s, 1, 2*time.Second)
-	conns := s.closed.closedClients()
+	conns := s.closedClients()
 	if lc := len(conns); lc != 1 {
 		t.Fatalf("len(conns) expected to be %d, got %d\n", 1, lc)
 	}
@@ -303,7 +303,7 @@ func TestNoRaceClosedSlowConsumerPendingBytes(t *testing.T) {
 
 	// At this point server should have closed connection c.
 	checkClosedConns(t, s, 1, 2*time.Second)
-	conns := s.closed.closedClients()
+	conns := s.closedClients()
 	if lc := len(conns); lc != 1 {
 		t.Fatalf("len(conns) expected to be %d, got %d\n", 1, lc)
 	}
@@ -1102,14 +1102,13 @@ func TestNoRaceJetStreamDeleteStreamManyConsumers(t *testing.T) {
 	defer s.Shutdown()
 
 	mname := "MYS"
-	// Explicitly set MaxConsumers, otherwise the server default limit would kick in.
-	mset, err := s.globalAccount().addStream(&StreamConfig{Name: mname, Storage: FileStorage, MaxConsumers: 2000})
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{Name: mname, Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
 
 	// This number needs to be higher than the internal sendq size to trigger what this test is testing.
-	for i := range 2000 {
+	for i := 0; i < 2000; i++ {
 		_, err := mset.addConsumer(&ConsumerConfig{
 			Durable:        fmt.Sprintf("D-%d", i),
 			DeliverSubject: fmt.Sprintf("deliver.%d", i),
@@ -1270,7 +1269,7 @@ func TestNoRaceJetStreamAPIConsumerListPaging(t *testing.T) {
 	defer s.Shutdown()
 
 	sname := "MYSTREAM"
-	mset, err := s.globalAccount().addStream(&StreamConfig{Name: sname, MaxConsumers: JSApiNamesLimit})
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{Name: sname})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -5489,10 +5488,9 @@ func TestNoRaceJetStreamClusterConsumerListPaging(t *testing.T) {
 	defer nc.Close()
 
 	_, err := js.AddStream(&nats.StreamConfig{
-		Name:         "TEST",
-		Subjects:     []string{"foo"},
-		Replicas:     3,
-		MaxConsumers: 5000,
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
 	})
 	require_NoError(t, err)
 	c.waitOnStreamLeader(globalAccountName, "TEST")

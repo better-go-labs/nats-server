@@ -5649,20 +5649,16 @@ func (fs *fileStore) SkipMsgs(seq uint64, num uint64) error {
 		}
 		seq = fs.state.LastSeq + 1
 	}
-	// Make sure the last sequence leaves room for the next message.
-	if num == 0 || seq == 0 || num > math.MaxUint64-seq {
-		return ErrSequenceMismatch
-	}
 
 	// Limit number of dmap entries
 	const maxDeletes = 64 * 1024
 	mb := fs.lmb
 
 	var msgs uint64
-	numDeletes := num
+	numDeletes := int(num)
 	if mb != nil {
 		mb.mu.RLock()
-		numDeletes = addSaturate(numDeletes, uint64(mb.dmap.Size()))
+		numDeletes += mb.dmap.Size()
 		msgs = mb.msgs
 		mb.mu.RUnlock()
 	}

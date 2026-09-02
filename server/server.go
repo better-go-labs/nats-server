@@ -310,8 +310,7 @@ type Server struct {
 	}
 
 	// For eventIDs
-	eventIdsMu sync.Mutex
-	eventIds   *nuid.NUID
+	eventIds *nuid.NUID
 
 	// Websocket structure
 	websocket srvWebsocket
@@ -3399,9 +3398,10 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	// Re-Grab lock
 	c.mu.Lock()
 
+	isClosed := c.isClosed()
 	var pre []byte
 	// We need first to check for "TLS First" fallback delay.
-	if !c.isClosed() && tlsFirstFallback > 0 {
+	if !isClosed && tlsFirstFallback > 0 {
 		// We wait and see if we are getting any data. Since we did not send
 		// the INFO protocol yet, only clients that use TLS first should be
 		// sending data (the TLS handshake). We don't really check the content:
@@ -3409,12 +3409,9 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 		// TLS handshake, the error will be detected when performing the
 		// handshake on our side.
 		pre = make([]byte, 4)
-		nc := c.nc
-		c.mu.Unlock()
-		_ = nc.SetReadDeadline(time.Now().Add(tlsFirstFallback))
-		n, _ := io.ReadFull(nc, pre[:])
-		_ = nc.SetReadDeadline(time.Time{})
-		c.mu.Lock()
+		c.nc.SetReadDeadline(time.Now().Add(tlsFirstFallback))
+		n, _ := io.ReadFull(c.nc, pre[:])
+		c.nc.SetReadDeadline(time.Time{})
 		// If we get any data (regardless of possible timeout), we will proceed
 		// with the TLS handshake.
 		if n > 0 {
@@ -3432,20 +3429,19 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 			c.sendProtoNow(infoBytes)
 			// Set the boolean to false for the rest of the function.
 			tlsFirst = false
+			// Check closed status again
+			isClosed = c.isClosed()
 		}
 	}
 	// If we have both TLS and non-TLS allowed we need to see which
 	// one the client wants. We'll always allow this for in-process
 	// connections.
 	sniffTLS := !tlsFirst && opts.TLSConfig != nil && (inProcess || opts.AllowNonTLS)
-	if !c.isClosed() && sniffTLS {
+	if !isClosed && sniffTLS {
 		pre = make([]byte, 6) // Minimum 6 bytes for proxy proto in next step.
-		nc := c.nc
-		c.mu.Unlock()
-		_ = nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
-		n, _ := io.ReadFull(nc, pre[:])
-		_ = nc.SetReadDeadline(time.Time{})
-		c.mu.Lock()
+		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
+		n, _ := io.ReadFull(c.nc, pre[:])
+		c.nc.SetReadDeadline(time.Time{})
 		pre = pre[:n]
 		tlsRequired = n > 0 && pre[0] == 0x16
 	}
@@ -3455,27 +3451,18 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	// before doing TLS even when TLS is required. Any bytes read past the
 	// header are kept in `pre` and replayed into the TLS handshake (or the
 	// non-TLS protocol parser) by the tlsMixConn wrapper used below.
-	if !c.isClosed() && opts.ProxyProtocol {
+	if !isClosed && opts.ProxyProtocol {
 		if len(pre) == 0 {
 			// There has been no pre-read yet, do so so we can work out
 			// if the client is trying to negotiate PROXY.
 			pre = make([]byte, 6)
-			nc := c.nc
-			c.mu.Unlock()
-			_ = nc.SetReadDeadline(time.Now().Add(proxyProtoReadTimeout))
-			n, _ := io.ReadFull(nc, pre)
-			_ = nc.SetReadDeadline(time.Time{})
-			c.mu.Lock()
+			c.nc.SetReadDeadline(time.Now().Add(proxyProtoReadTimeout))
+			n, _ := io.ReadFull(c.nc, pre)
+			c.nc.SetReadDeadline(time.Time{})
 			pre = pre[:n]
 		}
 		conn = &tlsMixConn{conn, bytes.NewBuffer(pre)}
-		c.mu.Unlock()
 		addr, proxyPre, err := readProxyProtoHeader(conn)
-		c.mu.Lock()
-		if c.isClosed() {
-			c.mu.Unlock()
-			return nil
-		}
 		if err != nil && err != errProxyProtoUnrecognized {
 			// err != errProxyProtoUnrecognized implies that we detected a proxy
 			// protocol header but we failed to parse it, so don't continue.
@@ -3510,12 +3497,9 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 			// header (reading it from the connection if needed).
 			if len(pre) == 0 {
 				buf := make([]byte, 1)
-				nc := c.nc
-				c.mu.Unlock()
-				_ = nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
-				n, _ := io.ReadFull(nc, buf)
-				_ = nc.SetReadDeadline(time.Time{})
-				c.mu.Lock()
+				c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
+				n, _ := io.ReadFull(c.nc, buf)
+				c.nc.SetReadDeadline(time.Time{})
 				pre = buf[:n]
 			}
 			tlsRequired = len(pre) > 0 && pre[0] == 0x16
@@ -3528,7 +3512,7 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	}
 
 	// Check for TLS
-	if !c.isClosed() && tlsRequired {
+	if !isClosed && tlsRequired {
 		if s.connRateCounter != nil && !s.connRateCounter.allow() {
 			c.mu.Unlock()
 			c.sendErr("Connection throttling is active. Please try again later.")
@@ -3550,13 +3534,15 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	}
 
 	// Now, send the INFO if it was delayed
-	if !c.isClosed() && tlsFirst {
+	if !isClosed && tlsFirst {
 		c.flags.set(didTLSFirst)
 		c.sendProtoNow(infoBytes)
+		// Check closed status
+		isClosed = c.isClosed()
 	}
 
 	// Connection could have been closed while sending the INFO proto.
-	if c.isClosed() {
+	if isClosed {
 		c.mu.Unlock()
 		// We need to call closeConnection() to make sure that proper cleanup is done.
 		c.closeConnection(WriteError)
@@ -3629,9 +3615,11 @@ func (s *Server) saveClosedClient(c *client, nc net.Conn, subs map[string]*subsc
 	c.mu.Unlock()
 
 	// Place in the ring buffer
+	s.mu.Lock()
 	if s.closed != nil {
 		s.closed.append(cc)
 	}
+	s.mu.Unlock()
 }
 
 // Adds to the list of client and websocket clients connect URLs.
@@ -4118,6 +4106,24 @@ func (s *Server) startGoRoutine(f func(), tags ...pprofLabels) bool {
 		started = true
 	}
 	return started
+}
+
+func (s *Server) numClosedConns() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed.len()
+}
+
+func (s *Server) totalClosedConns() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed.totalConns()
+}
+
+func (s *Server) closedClients() []*closedClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed.closedClients()
 }
 
 // getClientConnectURLs returns suitable URLs for clients to connect to the listen
