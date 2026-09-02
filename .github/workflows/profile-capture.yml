@@ -50,11 +50,11 @@ jobs:
         run: |
           set -x
           # `timeout` bounds wall-clock so load outlives the capture window
-          # (15s steady-state wait + 30s capture = 45s). `--msgs` is high enough
-          # that neither side exits on its own before `timeout` stops it.
-          timeout 60s nats bench sub pgo-bench --clients 8 --msgs 1000000000 >/dev/null 2>&1 &
+          # (15s steady-state wait + 240s capture = 255s). `--msgs` is high
+          # enough that neither side exits on its own before `timeout` stops it.
+          timeout 270s nats bench sub pgo-bench --clients 8 --msgs 1000000000 >/dev/null 2>&1 &
           sleep 1
-          timeout 55s nats bench pub pgo-bench --clients 8 --size 256 --msgs 1000000000 >/dev/null 2>&1 &
+          timeout 265s nats bench pub pgo-bench --clients 8 --size 256 --msgs 1000000000 >/dev/null 2>&1 &
           echo "load generators started"
 
       - name: Wait for steady state
@@ -65,7 +65,7 @@ jobs:
         with:
           pgoctl-version: v0.1.1
           pprof-url: http://localhost:6060
-          duration: '30'
+          duration: '240'
           artifact-name: default-pgo
           upload-artifact: 'true'
           comment-on-pr: 'true'
