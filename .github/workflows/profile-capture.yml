@@ -49,20 +49,34 @@ jobs:
           nc -z localhost 4222 \
             || { echo "::error::nats-server did not start in time"; exit 1; }
 
-      - name: Start load via nats bench (nohup, 8B msgs, timeout 3360s)
+      - name: Start load via nats bench pub+sub (nohup, 8B msgs, timeout 3360s)
         run: |
+          # nats CLI v0.4.0 uses bench subcommands: bench pub / bench sub
+          # Dump help for flag reference if something fails below
+          echo "=== nats bench pub --help ==="; nats bench pub --help 2>&1 | head -25 || true
+          echo "=== nats bench sub --help ==="; nats bench sub --help 2>&1 | head -25 || true
+
           ulimit -n 65536
-          nohup timeout 3360s nats bench pgo-load \
-            --pub 1 --sub 1 \
+          # Start subscriber first so it is ready before pub begins
+          nohup timeout 3360s nats bench sub pgo-load \
             --msgs 8000000000 \
-            > bench.log 2>&1 &
-          echo "NATS_BENCH_PID=$!" >> "$GITHUB_ENV"
-          # Allow 5 seconds for pub/sub to ramp before capture begins
-          sleep 5
-          # Verify bench is still running (immediate exit = connection failure)
-          kill -0 "$NATS_BENCH_PID" 2>/dev/null \
-            || { echo "::error::nats bench failed to start — check bench.log"; cat bench.log; exit 1; }
-          echo "nats bench running (PID $NATS_BENCH_PID)"
+            > bench-sub.log 2>&1 &
+          echo "NATS_BENCH_SUB_PID=$!" >> "$GITHUB_ENV"
+          # Wait for sub to connect and register
+          sleep 2
+          # Start publisher
+          nohup timeout 3360s nats bench pub pgo-load \
+            --msgs 8000000000 \
+            > bench-pub.log 2>&1 &
+          echo "NATS_BENCH_PUB_PID=$!" >> "$GITHUB_ENV"
+          # Allow 3 more seconds for load to ramp before capture begins
+          sleep 3
+          # Verify both processes are still alive (immediate exit = CLI error)
+          kill -0 "$NATS_BENCH_SUB_PID" 2>/dev/null \
+            || { echo "::error::nats bench sub failed to start"; cat bench-sub.log; exit 1; }
+          kill -0 "$NATS_BENCH_PUB_PID" 2>/dev/null \
+            || { echo "::error::nats bench pub failed to start"; cat bench-pub.log; exit 1; }
+          echo "nats bench pub+sub running (sub=$NATS_BENCH_SUB_PID pub=$NATS_BENCH_PUB_PID)"
 
       - name: Capture PGO profile via pgoctl (3200s window)
         id: pgoctl
@@ -79,10 +93,13 @@ jobs:
       - name: Stop load generators and server
         if: always()
         run: |
-          kill "$NATS_BENCH_PID" 2>/dev/null || true
+          kill "$NATS_BENCH_PUB_PID" 2>/dev/null || true
+          kill "$NATS_BENCH_SUB_PID" 2>/dev/null || true
           kill "$NATS_SERVER_PID" 2>/dev/null || true
-          echo "=== bench.log ==="
-          cat bench.log 2>/dev/null || echo "(bench.log not found)"
+          echo "=== bench-sub.log ==="
+          cat bench-sub.log 2>/dev/null || echo "(bench-sub.log not found)"
+          echo "=== bench-pub.log ==="
+          cat bench-pub.log 2>/dev/null || echo "(bench-pub.log not found)"
 
       # ── EVALUATE: baseline vs PGO benchstat ──────────────────────────────────
 
