@@ -38,7 +38,8 @@ jobs:
         run: |
           ulimit -n 65536
           ./nats-server --profile 6060 &
-          echo "NATS_SERVER_PID=$!" >> "$GITHUB_ENV"
+          NATS_SERVER_PID=$!
+          echo "NATS_SERVER_PID=$NATS_SERVER_PID" >> "$GITHUB_ENV"
           for i in $(seq 1 20); do
             if nc -z localhost 4222 2>/dev/null; then
               echo "nats-server ready"
@@ -52,26 +53,31 @@ jobs:
       - name: Start load via nats bench pub+sub (looped batches, timeout 3360s)
         run: |
           ulimit -n 65536
-          # nats bench pre-allocates [][]byte{N} for --msgs N (8 bytes per msg).
+          # nats bench pre-allocates [][]byte{N} for --msgs N (8 bytes/entry).
           # Large N values OOM the runner; no --msgs defaults to 100K and exits fast.
           # Solution: loop with default batches inside timeout 3360s.
           # The loop-wrapper PID stays alive for the capture window; individual
           # 100K-msg iterations complete in seconds and restart automatically.
+          #
+          # IMPORTANT: $GITHUB_ENV sets vars for FUTURE steps only, not the current
+          # shell. Must assign $! to a local shell var for same-step kill -0 check.
           nohup timeout 3360s bash -c '
             while true; do
               nats bench sub pgo-load 2>&1 || true
             done
           ' > bench-sub.log 2>&1 &
-          echo "NATS_BENCH_SUB_PID=$!" >> "$GITHUB_ENV"
+          NATS_BENCH_SUB_PID=$!
+          echo "NATS_BENCH_SUB_PID=$NATS_BENCH_SUB_PID" >> "$GITHUB_ENV"
           sleep 2
           nohup timeout 3360s bash -c '
             while true; do
               nats bench pub pgo-load 2>&1 || true
             done
           ' > bench-pub.log 2>&1 &
-          echo "NATS_BENCH_PUB_PID=$!" >> "$GITHUB_ENV"
+          NATS_BENCH_PUB_PID=$!
+          echo "NATS_BENCH_PUB_PID=$NATS_BENCH_PUB_PID" >> "$GITHUB_ENV"
           sleep 3
-          # kill -0 checks the timeout/bash wrapper PID (alive for 3360s), not individual bench runs
+          # kill -0 checks the timeout/bash wrapper PID (alive for 3360s)
           kill -0 "$NATS_BENCH_SUB_PID" 2>/dev/null \
             || { echo "::error::nats bench sub loop failed to start"; cat bench-sub.log; exit 1; }
           kill -0 "$NATS_BENCH_PUB_PID" 2>/dev/null \
