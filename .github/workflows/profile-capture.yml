@@ -1,0 +1,116 @@
+name: PGO Profile Capture and Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  capture-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Capture PGO profile via self-profiling benchmark run
+        run: |
+          # Use full Benchmark.*Pub.* pattern to cover all pub/sub/throughput/latency
+          # hot paths in the nats-server test suite. Excludes PubServiceImports and
+          # PubSubAccsImport which require service-import/account setup the CI harness
+          # doesn't provide (connection reset / authorization violation).
+          #
+          # benchtime=10s per benchmark keeps total capture time under ~5 min
+          # across the matching benchmarks while generating enough CPU samples
+          # per hot path for meaningful PGO inlining decisions.
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark.*Pub.*' \
+            -skip='PubServiceImports|PubSubAccsImport' \
+            ./test/ \
+            -benchtime=10s -count=1 \
+            -cpuprofile="$GITHUB_WORKSPACE/default.pgo"
+
+      - name: Validate PGO profile
+        run: |
+          BYTES=$(wc -c < "$GITHUB_WORKSPACE/default.pgo")
+          echo "Profile: ${BYTES} bytes"
+          if [ "${BYTES}" -lt 10000 ]; then
+            echo "::error::Profile too small (${BYTES} bytes) -- benchmarks may not have run"
+            exit 1
+          fi
+          echo "Profile capture OK"
+
+      - name: Upload PGO profile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: default-pgo
+          path: default.pgo
+          if-no-files-found: error
+
+      - name: Baseline benchmarks (no PGO, n=10)
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark.*Pub.*' \
+            -skip='PubServiceImports|PubSubAccsImport' \
+            -benchmem -count=10 -pgo=off ./test/ | tee baseline.txt
+
+      - name: PGO benchmarks (n=10)
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark.*Pub.*' \
+            -skip='PubServiceImports|PubSubAccsImport' \
+            -benchmem -count=10 -pgo="$GITHUB_WORKSPACE/default.pgo" ./test/ | tee pgo.txt
+
+      - name: benchstat comparison
+        run: |
+          benchstat baseline.txt pgo.txt | tee benchstat.txt
+          {
+            echo '### PGO benchstat (no-PGO vs. PGO)'
+            echo '```'
+            cat benchstat.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate PR comment
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## PGO Benchmark — baseline vs PGO"
+            echo ""
+            echo "_n=10, Benchmark.*Pub.* (excl. PubServiceImports, PubSubAccsImport). Signal: ≥2–3% geomean at p<0.05._"
+            echo ""
+            echo '```'
+            cat benchstat.txt
+            echo '```'
+          } > pr-comment.md
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: pgo-benchmark
+          path: pr-comment.md
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          if-no-files-found: warn
+          path: |
+            baseline.txt
+            pgo.txt
+            benchstat.txt
