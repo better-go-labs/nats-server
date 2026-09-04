@@ -24,40 +24,67 @@ jobs:
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
 
-      - name: Capture PGO profile via self-profiling benchmark run
-        run: |
-          # Use full Benchmark.*Pub.* pattern to cover all pub/sub/throughput/latency
-          # hot paths in the nats-server test suite. Excludes PubServiceImports and
-          # PubSubAccsImport which require service-import/account setup the CI harness
-          # doesn't provide (connection reset / authorization violation).
-          #
-          # benchtime=10s per benchmark keeps total capture time under ~5 min
-          # across the matching benchmarks while generating enough CPU samples
-          # per hot path for meaningful PGO inlining decisions.
-          ulimit -n 8192
-          go test -run=^$ \
-            -bench='Benchmark.*Pub.*' \
-            -skip='PubServiceImports|PubSubAccsImport' \
-            ./test/ \
-            -benchtime=10s -count=1 \
-            -cpuprofile="$GITHUB_WORKSPACE/default.pgo"
+      # ── CAPTURE: nats bench drives real pub/sub load → pgoctl collects profile ──
 
-      - name: Validate PGO profile
+      - name: Install NATS CLI
         run: |
-          BYTES=$(wc -c < "$GITHUB_WORKSPACE/default.pgo")
-          echo "Profile: ${BYTES} bytes"
-          if [ "${BYTES}" -lt 10000 ]; then
-            echo "::error::Profile too small (${BYTES} bytes) -- benchmarks may not have run"
-            exit 1
-          fi
-          echo "Profile capture OK"
+          go install github.com/nats-io/natscli/nats@latest
+          nats --version
 
-      - name: Upload PGO profile artifact
-        uses: actions/upload-artifact@v4
+      - name: Build nats-server
+        run: go build -o nats-server .
+
+      - name: Start nats-server with pprof enabled
+        run: |
+          ulimit -n 65536
+          ./nats-server --profile 6060 &
+          echo "NATS_SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            if nc -z localhost 4222 2>/dev/null; then
+              echo "nats-server ready"
+              break
+            fi
+            sleep 1
+          done
+          nc -z localhost 4222 \
+            || { echo "::error::nats-server did not start in time"; exit 1; }
+
+      - name: Start load via nats bench (nohup, 8B msgs, timeout 3360s)
+        run: |
+          ulimit -n 65536
+          nohup timeout 3360s nats bench pgo-load \
+            --pub 1 --sub 1 \
+            --msgs 8000000000 \
+            > bench.log 2>&1 &
+          echo "NATS_BENCH_PID=$!" >> "$GITHUB_ENV"
+          # Allow 5 seconds for pub/sub to ramp before capture begins
+          sleep 5
+          # Verify bench is still running (immediate exit = connection failure)
+          kill -0 "$NATS_BENCH_PID" 2>/dev/null \
+            || { echo "::error::nats bench failed to start — check bench.log"; cat bench.log; exit 1; }
+          echo "nats bench running (PID $NATS_BENCH_PID)"
+
+      - name: Capture PGO profile via pgoctl (3200s window)
+        id: pgoctl
+        uses: better-go-labs/pgoctl@v0.1.3
         with:
-          name: default-pgo
-          path: default.pgo
-          if-no-files-found: error
+          pprof-url: http://localhost:6060
+          duration: 3200
+          timeout-buffer: 160
+          pgoctl-version: v0.1.3
+          artifact-name: default-pgo
+          comment-on-pr: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stop load generators and server
+        if: always()
+        run: |
+          kill "$NATS_BENCH_PID" 2>/dev/null || true
+          kill "$NATS_SERVER_PID" 2>/dev/null || true
+          echo "=== bench.log ==="
+          cat bench.log 2>/dev/null || echo "(bench.log not found)"
+
+      # ── EVALUATE: baseline vs PGO benchstat ──────────────────────────────────
 
       - name: Baseline benchmarks (no PGO, n=10)
         run: |
@@ -73,7 +100,9 @@ jobs:
           go test -run=^$ \
             -bench='Benchmark.*Pub.*' \
             -skip='PubServiceImports|PubSubAccsImport' \
-            -benchmem -count=10 -pgo="$GITHUB_WORKSPACE/default.pgo" ./test/ | tee pgo.txt
+            -benchmem -count=10 \
+            -pgo="${{ steps.pgoctl.outputs.artifact-path }}" \
+            ./test/ | tee pgo.txt
 
       - name: benchstat comparison
         run: |
