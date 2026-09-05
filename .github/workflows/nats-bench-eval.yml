@@ -31,8 +31,6 @@ jobs:
         run: |
           go install github.com/nats-io/natscli/nats@latest
           nats --version
-          echo "--- nats bench pub help ---"
-          nats bench pub --help 2>&1 | head -30 || true
 
       - name: Download PGO profile (latest captured artifact)
         run: |
@@ -67,33 +65,16 @@ jobs:
           ls -lh nats-server-pgo
           ./nats-server-pgo --version
 
-      - name: Probe bench pub output format
-        run: |
-          ulimit -n 65536
-          ./nats-server-baseline -p 4222 > /dev/null 2>&1 &
-          SRV_PID=$!
-          for i in $(seq 1 20); do nc -z localhost 4222 2>/dev/null && break; sleep 0.3; done
-          echo "=== probe: nats bench sub + pub (1000 msgs, 128B) ==="
-          nats bench sub pgo-probe 2>&1 &
-          PSUB=$!
-          sleep 0.5
-          nats bench pub pgo-probe --msgs 1000 --size 128 2>&1 || true
-          kill "$PSUB" 2>/dev/null || true
-          wait "$PSUB" 2>/dev/null || true
-          kill "$SRV_PID" 2>/dev/null || true
-          for i in $(seq 1 10); do nc -z localhost 4222 2>/dev/null || break; sleep 0.3; done
-
       - name: Run alternating nats-bench trials (N=5, 3 scenarios)
         run: |
           ulimit -n 65536
           mkdir -p results/baseline/s128b results/baseline/s512b results/baseline/s1kb
           mkdir -p results/pgo/s128b results/pgo/s512b results/pgo/s1kb
 
-          # Scenarios: name:msgs:size
-          # Memory per pub call: msgs x size (all well within 7GB runner)
-          #   s128b: 200K x 128B  = ~26MB
-          #   s512b: 100K x 512B  = ~51MB
-          #   s1kb:   50K x 1024B = ~51MB
+          # Scenarios: msgs x size (all well within 7GB runner)
+          #   s128b: 200K x 128B  = ~26MB in-flight
+          #   s512b: 100K x 512B  = ~51MB in-flight
+          #   s1kb:   50K x 1024B = ~51MB in-flight
           TRIALS=5
 
           for trial in $(seq 1 $TRIALS); do
@@ -170,12 +151,23 @@ jobs:
           python3 << 'PYEOF'
           import os, re, math, json
 
-          def parse_throughput(text):
-              # Broad pattern: matches any "N msgs/sec ~ M MB/sec" regardless of prefix
-              m = re.search(r'([\d,]+)\s+msgs/sec\s+~\s+([\d.]+)\s+MB/sec', text)
+          def parse_line(text):
+              # Actual nats bench pub v0.4.0 output:
+              # "NATS Core NATS publisher stats: 1,522,574 msgs/sec ~ 186 MiB/sec
+              #  ~ min: 0.06us ~ avg: 0.50us ~ max: 6939.45us
+              #  ~ P50: 0.15us ~ P90: 0.17us ~ P99: 0.32us ~ P99.9: 15.46us"
+              msgs, mib, p50, p90, p99 = None, None, None, None, None
+              m = re.search(r'([\d,]+)\s+msgs/sec\s+~\s+([\d.]+)\s+MiB/sec', text)
               if m:
-                  return float(m.group(1).replace(',', '')), float(m.group(2))
-              return None, None
+                  msgs = float(m.group(1).replace(',', ''))
+                  mib = float(m.group(2))
+              m50 = re.search(r'P50:\s+([\d.]+)us', text)
+              m90 = re.search(r'P90:\s+([\d.]+)us', text)
+              m99 = re.search(r'P99:\s+([\d.]+)us', text)
+              if m50: p50 = float(m50.group(1))
+              if m90: p90 = float(m90.group(1))
+              if m99: p99 = float(m99.group(1))
+              return msgs, mib, p50, p90, p99
 
           def mean_std(vals):
               n = len(vals)
@@ -192,18 +184,24 @@ jobs:
           for build in builds:
               raw[build] = {}
               for sc, _ in scenarios:
-                  msgs_l, mb_l = [], []
+                  msgs_l, mib_l, p50_l, p90_l, p99_l = [], [], [], [], []
                   d = f'results/{build}/{sc}'
                   if os.path.isdir(d):
                       for fn in sorted(os.listdir(d)):
                           if not fn.startswith('trial'):
                               continue
                           text = open(f'{d}/{fn}').read()
-                          msgs, mb = parse_throughput(text)
+                          msgs, mib, p50, p90, p99 = parse_line(text)
                           if msgs is not None:
                               msgs_l.append(msgs)
-                              mb_l.append(mb)
-                  raw[build][sc] = {'msgs': msgs_l, 'mb': mb_l}
+                              mib_l.append(mib)
+                          if p50 is not None: p50_l.append(p50)
+                          if p90 is not None: p90_l.append(p90)
+                          if p99 is not None: p99_l.append(p99)
+                  raw[build][sc] = {
+                      'msgs': msgs_l, 'mib': mib_l,
+                      'p50': p50_l, 'p90': p90_l, 'p99': p99_l,
+                  }
 
           with open('results/raw.json', 'w') as f:
               json.dump(raw, f, indent=2)
@@ -217,7 +215,7 @@ jobs:
               '',
               '### Throughput - msgs/sec (pub)',
               '',
-              '| Scenario | Baseline (mean+/-sd) | PGO (mean+/-sd) | N (base/pgo) | Delta% |',
+              '| Scenario | Baseline mean | PGO mean | N (base/pgo) | Delta% |',
               '|---|---|---|---|---|',
           ]
 
@@ -234,19 +232,38 @@ jobs:
 
           L += [
               '',
-              '### Throughput - MB/s',
+              '### Throughput - MiB/sec',
               '',
-              '| Scenario | Baseline (mean+/-sd) | PGO (mean+/-sd) | Delta% |',
+              '| Scenario | Baseline mean | PGO mean | Delta% |',
               '|---|---|---|---|',
           ]
           for sc, label in scenarios:
-              bm, bs, _ = mean_std(raw['baseline'][sc]['mb'])
-              pm, ps, _ = mean_std(raw['pgo'][sc]['mb'])
+              bm, bs, _ = mean_std(raw['baseline'][sc]['mib'])
+              pm, ps, _ = mean_std(raw['pgo'][sc]['mib'])
               if bm and pm:
                   d = (pm - bm) / bm * 100
                   L.append(f'| {label} | {bm:.1f} +/- {bs:.1f} | {pm:.1f} +/- {ps:.1f} | {d:+.1f}% |')
               else:
                   L.append(f'| {label} | -- | -- | -- |')
+
+          L += [
+              '',
+              '### Latency (pub, microseconds)',
+              '',
+              '| Scenario | Baseline P50/P90/P99 | PGO P50/P90/P99 |',
+              '|---|---|---|',
+          ]
+          for sc, label in scenarios:
+              b50, _, _ = mean_std(raw['baseline'][sc]['p50'])
+              b90, _, _ = mean_std(raw['baseline'][sc]['p90'])
+              b99, _, _ = mean_std(raw['baseline'][sc]['p99'])
+              p50, _, _ = mean_std(raw['pgo'][sc]['p50'])
+              p90, _, _ = mean_std(raw['pgo'][sc]['p90'])
+              p99, _, _ = mean_std(raw['pgo'][sc]['p99'])
+              if b50 and p50:
+                  L.append(f'| {label} | {b50:.2f} / {b90:.2f} / {b99:.2f} us | {p50:.2f} / {p90:.2f} / {p99:.2f} us |')
+              else:
+                  L.append(f'| {label} | -- | -- |')
 
           L.append('')
           L.append('### Verdict')
@@ -271,7 +288,7 @@ jobs:
           else:
               L.append(
                   '**INCONCLUSIVE** -- Could not parse nats-bench output. '
-                  'Check the nats-bench-results artifact for raw trial files and the probe step logs.'
+                  'Check the nats-bench-results artifact for raw trial files.'
               )
 
           L += [
