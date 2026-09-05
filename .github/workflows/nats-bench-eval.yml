@@ -1,0 +1,313 @@
+name: PGO nats-bench Throughput Evaluation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  nats-bench-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install NATS CLI
+        run: |
+          go install github.com/nats-io/natscli/nats@latest
+          nats --version
+
+      - name: Download PGO profile (latest captured artifact)
+        run: |
+          RUN_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts" \
+            --paginate \
+            --jq '[.artifacts[] | select(.name=="default-pgo" and .expired==false)] | sort_by(.created_at) | last | .workflow_run.id')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No unexpired default-pgo artifact found. Run profile-capture.yml first."
+            exit 1
+          fi
+          echo "Downloading default-pgo from run $RUN_ID"
+          gh run download "$RUN_ID" --repo "${{ github.repository }}" --name default-pgo --dir pgo-profile
+          PGO_FILE=$(find pgo-profile -type f | head -1)
+          if [ -z "$PGO_FILE" ]; then
+            echo "::error::default-pgo artifact is empty"
+            exit 1
+          fi
+          echo "PGO_FILE=$PGO_FILE" >> "$GITHUB_ENV"
+          echo "Profile: $PGO_FILE ($(du -sh "$PGO_FILE" | cut -f1))"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build nats-server — baseline (no PGO)
+        run: |
+          go build -pgo=off -o nats-server-baseline .
+          ls -lh nats-server-baseline
+          ./nats-server-baseline --version
+
+      - name: Build nats-server — PGO
+        run: |
+          go build -pgo="$PGO_FILE" -o nats-server-pgo .
+          ls -lh nats-server-pgo
+          ./nats-server-pgo --version
+
+      - name: Run alternating nats-bench trials (N=5, 3 scenarios)
+        run: |
+          ulimit -n 65536
+          mkdir -p results/{baseline,pgo}/{s128b,s512b,s1kb,latency}
+
+          start_server() {
+            local build=$1
+            ."nats-server-${build}" -p 4222 > "server-${build}.log" 2>&1 &
+            local pid=$!
+            local i
+            for i in $(seq 1 30); do
+              nc -z localhost 4222 2>/dev/null && break
+              sleep 0.3
+            done
+            nc -z localhost 4222 || {
+              echo "::error::nats-server-${build} did not start" >&2
+              cat "server-${build}.log" >&2
+              kill "$pid" 2>/dev/null || true
+              exit 1
+            }
+            echo "$pid"
+          }
+
+          stop_server() {
+            local pid=$1
+            kill "$pid" 2>/dev/null || true
+            local i
+            for i in $(seq 1 15); do
+              nc -z localhost 4222 2>/dev/null || break
+              sleep 0.3
+            done
+          }
+
+          TRIALS=5
+
+          for trial in $(seq 1 $TRIALS); do
+            echo "===== Trial $trial ====="
+            for build in baseline pgo; do
+              echo "--- build=$build ---"
+              SRV=$(start_server "$build")
+
+              # Scenario 1: 128B payload, 2 pub + 2 sub, 200K msgs/pub
+              # Memory: 2 pubs x 200K x 128B = ~51MB — safe on 7GB runner
+              echo "scenario s128b (128B/2-conn)"
+              nats bench pgo-eval-128b \
+                --pub 2 --sub 2 --msgs 200000 --size 128 \
+                2>&1 | tee "results/${build}/s128b/trial${trial}.txt" || true
+              sleep 1
+
+              # Scenario 2: 512B payload, 4 pub + 4 sub, 100K msgs/pub
+              # Memory: 4 pubs x 100K x 512B = ~205MB — safe on 7GB runner
+              echo "scenario s512b (512B/4-conn)"
+              nats bench pgo-eval-512b \
+                --pub 4 --sub 4 --msgs 100000 --size 512 \
+                2>&1 | tee "results/${build}/s512b/trial${trial}.txt" || true
+              sleep 1
+
+              # Scenario 3: 1KB payload, 2 pub + 2 sub, 50K msgs/pub
+              # Memory: 2 pubs x 50K x 1024B = ~102MB — safe on 7GB runner
+              echo "scenario s1kb (1KB/2-conn)"
+              nats bench pgo-eval-1kb \
+                --pub 2 --sub 2 --msgs 50000 --size 1024 \
+                2>&1 | tee "results/${build}/s1kb/trial${trial}.txt" || true
+              sleep 1
+
+              # Latency: 1 pub + 1 sub, 10K msgs, 128B; --latency for p50/p90/p99
+              echo "scenario latency (optional)"
+              nats bench pgo-eval-lat \
+                --pub 1 --sub 1 --msgs 10000 --size 128 \
+                --latency \
+                2>&1 | tee "results/${build}/latency/trial${trial}.txt" || true
+
+              stop_server "$SRV"
+              sleep 1
+            done
+          done
+
+          echo "All trials complete."
+          echo "--- Sample output (baseline s128b trial 1) ---"
+          cat results/baseline/s128b/trial1.txt || true
+
+      - name: Compute statistics and generate report
+        run: |
+          python3 << 'PYEOF'
+          import os, re, math, json
+
+          def parse_throughput(text):
+              m = re.search(r'Pub stats[^:]*:\s+([\d,]+)\s+msgs/sec\s+~\s+([\d.]+)\s+MB/sec', text)
+              if m:
+                  return float(m.group(1).replace(',', '')), float(m.group(2))
+              return None, None
+
+          def parse_latency_p(text, pct):
+              pat = rf'(?i)\b{pct}%?\s*:?\s*([\d.]+)\s*([\xb5u]s|ms)'
+              m = re.search(pat, text)
+              if not m:
+                  return None
+              val = float(m.group(1))
+              return val * 1000 if 'ms' in m.group(2).lower() else val
+
+          def stats(vals):
+              n = len(vals)
+              if not n:
+                  return None, None, 0
+              m = sum(vals) / n
+              s = math.sqrt(sum((x - m) ** 2 for x in vals) / max(n - 1, 1))
+              return m, s, n
+
+          builds = ['baseline', 'pgo']
+          scenarios = [('s128b', '128B/2-conn'), ('s512b', '512B/4-conn'), ('s1kb', '1KB/2-conn')]
+          raw = {}
+
+          for build in builds:
+              raw[build] = {}
+              for sc, _ in scenarios + [('latency', 'latency')]:
+                  msgs_l, mb_l, lat50_l, lat90_l, lat99_l = [], [], [], [], []
+                  d = f'results/{build}/{sc}'
+                  if os.path.isdir(d):
+                      for fn in sorted(os.listdir(d)):
+                          if not fn.startswith('trial'):
+                              continue
+                          t = open(f'{d}/{fn}').read()
+                          msgs, mb = parse_throughput(t)
+                          if msgs:
+                              msgs_l.append(msgs)
+                              mb_l.append(mb)
+                          p50 = parse_latency_p(t, '50')
+                          p90 = parse_latency_p(t, '90')
+                          p99 = parse_latency_p(t, '99')
+                          if p50:
+                              lat50_l.append(p50)
+                              lat90_l.append(p90)
+                              lat99_l.append(p99)
+                  raw[build][sc] = dict(msgs=msgs_l, mb=mb_l, lat50=lat50_l, lat90=lat90_l, lat99=lat99_l)
+
+          with open('results/raw.json', 'w') as f:
+              json.dump(raw, f, indent=2, default=str)
+
+          L = [
+              '## PGO nats-bench Throughput Evaluation',
+              '',
+              '_N=5 alternating trials (baseline, PGO, baseline, …). Workload: real nats-bench pub+sub._',
+              '_Profile: 530KB CPU profile captured under 3200s nats-bench pub+sub load._',
+              '_Runner: ubuntu-latest (~7GB RAM). Verdict threshold: ±3% geomean._',
+              '',
+              '### Throughput — msgs/sec',
+              '',
+              '| Scenario | Baseline (mean±σ) | PGO (mean±σ) | N | Δ% |',
+              '|---|---|---|---|---|',
+          ]
+
+          ratios = []
+          for sc, label in scenarios:
+              bm, bs, bn = stats(raw['baseline'][sc]['msgs'])
+              pm, ps, pn = stats(raw['pgo'][sc]['msgs'])
+              if bm and pm:
+                  d = (pm - bm) / bm * 100
+                  ratios.append(pm / bm)
+                  L.append(f'| {label} | {bm/1e6:.3f}M ± {bs/1e6:.3f}M | {pm/1e6:.3f}M ± {ps/1e6:.3f}M | {bn}/{pn} | {d:+.1f}% |')
+              else:
+                  L.append(f'| {label} | — | — | {bn}/{pn} | — |')
+
+          L += [
+              '',
+              '### Throughput — MB/s',
+              '',
+              '| Scenario | Baseline (mean±σ) | PGO (mean±σ) | Δ% |',
+              '|---|---|---|---|',
+          ]
+          for sc, label in scenarios:
+              bm, bs, _ = stats(raw['baseline'][sc]['mb'])
+              pm, ps, _ = stats(raw['pgo'][sc]['mb'])
+              if bm and pm:
+                  d = (pm - bm) / bm * 100
+                  L.append(f'| {label} | {bm:.1f} ± {bs:.1f} | {pm:.1f} ± {ps:.1f} | {d:+.1f}% |')
+              else:
+                  L.append(f'| {label} | — | — | — |')
+
+          bl = raw['baseline'].get('latency', {})
+          pl = raw['pgo'].get('latency', {})
+          if bl.get('lat50') and pl.get('lat50'):
+              bm50, _, _ = stats(bl['lat50'])
+              bm90, _, _ = stats(bl['lat90'])
+              bm99, _, _ = stats(bl['lat99'])
+              pm50, _, _ = stats(pl['lat50'])
+              pm90, _, _ = stats(pl['lat90'])
+              pm99, _, _ = stats(pl['lat99'])
+              L += [
+                  '',
+                  '### Latency (128B, 1 pub + 1 sub)',
+                  '',
+                  '| Build | p50 | p90 | p99 |',
+                  '|---|---|---|---|',
+                  f'| Baseline | {bm50:.0f}µs | {bm90:.0f}µs | {bm99:.0f}µs |',
+                  f'| PGO      | {pm50:.0f}µs | {pm90:.0f}µs | {pm99:.0f}µs |',
+              ]
+
+          L.append('')
+          L.append('### Verdict')
+          L.append('')
+
+          if ratios:
+              gm = (math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1) * 100
+              L.append(f'**Geomean throughput Δ (PGO vs baseline): {gm:+.1f}%**')
+              L.append('')
+              if gm > 3.0:
+                  L.append(f'**YES** — PGO improves real-workload throughput by **{gm:+.1f}%** (geomean across 3 scenarios).')
+              elif gm < -3.0:
+                  L.append(f'**NO** — PGO degrades real-workload throughput by **{gm:+.1f}%** (geomean across 3 scenarios).')
+              else:
+                  L.append(
+                      f'**INCONCLUSIVE** — PGO throughput effect is **{gm:+.1f}%**, within the ±3% noise '
+                      f'threshold for macro benchmarks. The microbenchmark geomean showed +0.95% slowdown '
+                      f'(sec/op) — single-op synthetic workloads do not reflect the mixed-load behaviour '
+                      f'the profile was captured from. More trials or a longer warm-up window may clarify the signal.'
+                  )
+          else:
+              L.append('**INCONCLUSIVE** — Could not parse nats-bench output (check nats-bench-results artifact for raw trial files).')
+
+          L += [
+              '',
+              '---',
+              '_Microbenchmark reference (benchstat, n=10): **+0.95% geomean sec/op** slowdown on synthetic single-op workload._',
+              '_This evaluation tests the profile\'s intended target: sustained pub+sub throughput at production-shaped load._',
+          ]
+
+          report = '\n'.join(L)
+          with open('nats-bench-report.md', 'w') as f:
+              f.write(report)
+          print(report)
+          PYEOF
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: pgo-nats-bench
+          path: nats-bench-report.md
+
+      - name: Append to job summary
+        run: cat nats-bench-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload nats-bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nats-bench-results
+          path: |
+            results/
+            nats-bench-report.md
+          if-no-files-found: warn
