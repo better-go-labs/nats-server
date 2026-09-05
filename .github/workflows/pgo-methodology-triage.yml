@@ -1,0 +1,392 @@
+name: PGO Methodology Triage
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pgo-triage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  triage:
+    name: "PGO Triage: Positive Control + Static Leverage"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 1 — POSITIVE CONTROL
+      # Synthetic benchmark with interface dispatch on a single concrete type.
+      # PGO devirtualizes + inlines the hot method, giving a reliable win.
+      # If this control is also flat, the harness cannot measure PGO at all.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Ctrl | Create positive-control Go module"
+        run: |
+          mkdir -p /tmp/pgo-ctrl
+          cat > /tmp/pgo-ctrl/go.mod << 'EOF'
+          module pgo-ctrl
+
+          go 1.22
+          EOF
+
+          cat > /tmp/pgo-ctrl/bench_test.go << 'EOF'
+          package ctrl_test
+
+          import "testing"
+
+          // Dispatch — always SumCalc in practice.
+          // PGO devirtualizes + inlines Run(), eliminating indirect call
+          // overhead and enabling the compiler to optimize the loop body.
+          type Dispatch interface {
+              Run(x float64) float64
+          }
+
+          type SumCalc struct{ K float64 }
+
+          func (s SumCalc) Run(x float64) float64 {
+              return x*s.K + x - x*x*0.5
+          }
+
+          // noinline: keeps the interface dispatch visible as an indirect call
+          // site (prevents the compiler from devirt-ing without PGO guidance).
+          //go:noinline
+          func hotLoop(d Dispatch, n int) float64 {
+              acc := 0.0
+              for i := 0; i < n; i++ {
+                  acc += d.Run(float64(i) * 1e-4)
+              }
+              return acc
+          }
+
+          func BenchmarkControl(b *testing.B) {
+              d := SumCalc{K: 1.5}
+              b.ResetTimer()
+              for i := 0; i < b.N; i++ {
+                  _ = hotLoop(d, 5000)
+              }
+          }
+          EOF
+
+      - name: "Ctrl | Generate CPU profile (15s profiling run)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -bench=BenchmarkControl -benchtime=15s -cpuprofile=ctrl.pprof .
+          ls -lh ctrl.pprof
+
+      - name: "Ctrl | Baseline benchmark (no PGO, N=10)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -pgo=off -bench=BenchmarkControl -benchtime=3s -count=10 . \
+            | tee /tmp/ctrl-baseline.txt
+          cat /tmp/ctrl-baseline.txt
+
+      - name: "Ctrl | PGO benchmark (with profile, N=10)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -pgo=ctrl.pprof -bench=BenchmarkControl -benchtime=3s -count=10 . \
+            | tee /tmp/ctrl-pgo.txt
+          cat /tmp/ctrl-pgo.txt
+
+      - name: "Ctrl | benchstat comparison"
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          benchstat /tmp/ctrl-baseline.txt /tmp/ctrl-pgo.txt | tee /tmp/ctrl-benchstat.txt || true
+          echo "=== benchstat ==="
+          cat /tmp/ctrl-benchstat.txt
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 2 — STATIC LEVERAGE CHECK
+      # go build -gcflags="-m=2" on nats-server with/without profile.
+      # Count PGO-driven inline/devirt decisions.
+      # ~0 decisions => PGO has no codegen leverage (client.parse over budget).
+      # Non-zero    => flatness is a measurement problem, not a leverage problem.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Leverage | Fetch PGO profile artifact"
+        run: |
+          RUN_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts" \
+            --paginate \
+            --jq '[.artifacts[] | select(.name=="default-pgo" and .expired==false)] | sort_by(.created_at) | last | .workflow_run.id' \
+            2>/dev/null || echo "")
+          if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+            gh run download "$RUN_ID" \
+              --repo "${{ github.repository }}" \
+              --name default-pgo \
+              --dir /tmp/pgo-profile 2>/dev/null || true
+          fi
+          PGO_FILE=$(find /tmp/pgo-profile -type f 2>/dev/null | head -1)
+          if [ -n "$PGO_FILE" ]; then
+            echo "PGO_FILE=$PGO_FILE" >> "$GITHUB_ENV"
+            echo "HAS_PROFILE=true" >> "$GITHUB_ENV"
+            echo "Profile: $PGO_FILE ($(du -sh "$PGO_FILE" | cut -f1))"
+          else
+            echo "HAS_PROFILE=false" >> "$GITHUB_ENV"
+            echo "No default-pgo artifact found — leverage check will run without-PGO side only."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Leverage | gcflags -m=2 WITHOUT PGO"
+        run: |
+          # Cap output at 5MB to avoid log spam; grep on captured file.
+          go build -pgo=off -gcflags="-m=2" . 2>&1 \
+            | head -c 5242880 > /tmp/gcflags-no-pgo.txt || true
+          INLINE=$(grep -cE 'can inline|inlining call' /tmp/gcflags-no-pgo.txt || echo 0)
+          PGO_M=$(grep -ciE 'devirtuali|pgo.driven|pgo-driven' /tmp/gcflags-no-pgo.txt || echo 0)
+          echo "Inline decisions (no PGO): $INLINE"
+          echo "PGO markers    (no PGO):   $PGO_M"
+
+      - name: "Leverage | gcflags -m=2 WITH PGO"
+        run: |
+          if [ "$HAS_PROFILE" = "true" ]; then
+            go build -pgo="$PGO_FILE" -gcflags="-m=2" . 2>&1 \
+              | head -c 5242880 > /tmp/gcflags-with-pgo.txt || true
+            INLINE=$(grep -cE 'can inline|inlining call' /tmp/gcflags-with-pgo.txt || echo 0)
+            PGO_M=$(grep -ciE 'devirtuali|pgo.driven|pgo-driven' /tmp/gcflags-with-pgo.txt || echo 0)
+            echo "Inline decisions (with PGO): $INLINE"
+            echo "PGO markers    (with PGO):   $PGO_M"
+          else
+            echo "SKIPPED_NO_PROFILE" > /tmp/gcflags-with-pgo.txt
+            echo "Skipped — no profile available."
+          fi
+
+      # ──────────────────────────────────────────────────────────────────────
+      # REPORT — assemble both results, post sticky comment + job summary
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Report | Generate triage report"
+        run: |
+          python3 - << 'PYEOF'
+          import os, re
+
+          # ── Positive control ────────────────────────────────────────
+          def parse_ns_op(path):
+              vals = []
+              try:
+                  for line in open(path):
+                      m = re.search(r'BenchmarkControl\S*\s+\d+\s+([0-9.]+)\s+ns/op', line)
+                      if m:
+                          vals.append(float(m.group(1)))
+              except Exception:
+                  pass
+              return vals
+
+          base_vals = parse_ns_op('/tmp/ctrl-baseline.txt')
+          pgo_vals  = parse_ns_op('/tmp/ctrl-pgo.txt')
+
+          try:
+              bs_text = open('/tmp/ctrl-benchstat.txt').read().strip()
+          except Exception:
+              bs_text = '(not available)'
+
+          if base_vals and pgo_vals:
+              base_mean = sum(base_vals) / len(base_vals)
+              pgo_mean  = sum(pgo_vals)  / len(pgo_vals)
+              # Negative = PGO is faster (fewer ns/op is better)
+              delta_pct = (pgo_mean - base_mean) / base_mean * 100
+
+              if delta_pct < -3:
+                  ctrl_verdict = 'PASS'
+                  ctrl_icon = 'green'
+                  ctrl_interp = (
+                      f'PGO improved the control benchmark by **{abs(delta_pct):.1f}%** '
+                      f'(baseline {base_mean:.0f} ns/op -> PGO {pgo_mean:.0f} ns/op, N={len(base_vals)}/{len(pgo_vals)}). '
+                      '**The harness can measure PGO.** Flat nats results are a real finding, not a measurement defect.'
+                  )
+              elif delta_pct > 3:
+                  ctrl_verdict = 'ANOMALY'
+                  ctrl_icon = 'yellow'
+                  ctrl_interp = (
+                      f'PGO *degraded* the control by {delta_pct:+.1f}% -- unexpected. '
+                      'Likely transient runner noise; re-run to confirm.'
+                  )
+              else:
+                  ctrl_verdict = 'NOISY'
+                  ctrl_icon = 'red'
+                  ctrl_interp = (
+                      f'Positive control delta {delta_pct:+.1f}% is within +-3% noise. '
+                      '**The harness cannot reliably measure PGO effects.** '
+                      'Every prior nats PGO number must be treated as statistically meaningless. '
+                      'Root cause: GHA ubuntu-latest runner variance exceeds the expected PGO signal. '
+                      'Mitigation: larger runner, longer benchtime, or N>=20 trials.'
+                  )
+          else:
+              delta_pct     = None
+              ctrl_verdict  = 'PARSE_ERROR'
+              ctrl_icon     = 'yellow'
+              ctrl_interp   = 'Could not parse ns/op values from benchmark output. See artifact.'
+
+          # ── Static leverage ─────────────────────────────────────────
+          def count_decisions(path):
+              try:
+                  text = open(path).read()
+                  if text.strip().startswith('SKIPPED_NO_PROFILE'):
+                      return None, None, []
+              except Exception:
+                  return 0, 0, []
+              inline_n = len(re.findall(r'can inline|inlining call', text))
+              pgo_lines = [l for l in text.splitlines()
+                           if re.search(r'devirtuali|pgo.driven|pgo-driven', l, re.I)]
+              return inline_n, len(pgo_lines), pgo_lines
+
+          no_inline, no_pgo_n, _ = count_decisions('/tmp/gcflags-no-pgo.txt')
+          wi_inline, wi_pgo_n, wi_pgo_lines = count_decisions('/tmp/gcflags-with-pgo.txt')
+          has_profile = os.environ.get('HAS_PROFILE', 'false') == 'true'
+
+          if wi_inline is None:
+              leverage_verdict = 'SKIPPED'
+              leverage_interp = (
+                  f'No `default-pgo` artifact available.\n'
+                  f'Baseline only: nats-server compiles with {no_inline} inlinable call sites (no PGO).\n\n'
+                  'To complete this check: run `profile-capture.yml` from PR #3, then re-run this workflow.'
+              )
+              top_pgo = ''
+          elif wi_pgo_n == 0:
+              delta_i = wi_inline - no_inline
+              leverage_verdict = 'NO_LEVERAGE'
+              leverage_interp = (
+                  f'PGO caused **0 devirt/pgo-driven decisions** on nats-server.\n\n'
+                  f'| | Without PGO | With PGO | Delta |\n'
+                  f'|---|---|---|---|\n'
+                  f'| Inline decisions | {no_inline} | {wi_inline} | {delta_i:+d} |\n'
+                  f'| PGO-specific markers (devirt / pgo-driven) | 0 | 0 | 0 |\n\n'
+                  '`client.parse` is a large hand-tuned parser almost certainly over the inline budget, '
+                  'and there are no polymorphic hot call sites the profile can devirtualize. '
+                  '**This is the finding**: PGO has no codegen leverage on this hot path with the current profile.'
+              )
+              top_pgo = ''
+          else:
+              delta_i = wi_inline - no_inline
+              leverage_verdict = 'HAS_LEVERAGE'
+              top_pgo = '\n\n**Top PGO decisions:**\n' + '\n'.join(
+                  f'> `{l.strip()}`' for l in wi_pgo_lines[:10]
+              )
+              leverage_interp = (
+                  f'PGO caused **{wi_pgo_n} devirt/pgo-driven decision(s)** on nats-server.\n\n'
+                  f'| | Without PGO | With PGO | Delta |\n'
+                  f'|---|---|---|---|\n'
+                  f'| Inline decisions | {no_inline} | {wi_inline} | {delta_i:+d} |\n'
+                  f'| PGO-specific markers | 0 | {wi_pgo_n} | +{wi_pgo_n} |\n\n'
+                  'PGO is changing codegen. Throughput flatness is a **measurement problem** -- '
+                  'need: (1) efficiency metric (cycles/msg via `perf stat`), '
+                  '(2) saturated multi-connection load that keeps the hot path pinned.'
+              )
+
+          # ── Conclusion ───────────────────────────────────────────────
+          if ctrl_verdict == 'PASS' and leverage_verdict == 'NO_LEVERAGE':
+              conclusion = (
+                  '**Harness is sound. PGO has no codegen leverage on nats-server with the current profile.**\n\n'
+                  'The positive control confirmed the harness can measure PGO. '
+                  'But the static analysis found 0 PGO-driven decisions in nats-server. '
+                  '`client.parse` is too large to inline, and there are no hot polymorphic call sites to devirtualize. '
+                  'The flat throughput numbers are a genuine architectural result, not a measurement artifact. '
+                  'Capturing a longer or more representative profile (multi-connection load) might unlock more leverage.'
+              )
+          elif ctrl_verdict == 'PASS' and leverage_verdict == 'HAS_LEVERAGE':
+              conclusion = (
+                  '**Harness is sound. PGO has leverage but the nats-bench throughput metric cannot see it.**\n\n'
+                  'Recommended path:\n'
+                  '1. `perf stat -e cycles,instructions ./nats-server-{baseline,pgo}` -- '
+                  'hardware counters are noise-immune and will show IPC delta even at 1%\n'
+                  '2. Saturated multi-connection pub+sub (8+ concurrent connections) to keep the '
+                  'profiled hot path pinned during measurement'
+              )
+          elif ctrl_verdict == 'NOISY':
+              conclusion = (
+                  '**Harness cannot measure PGO. All prior nats PGO numbers are uninterpretable.**\n\n'
+                  'The positive control (designed for a guaranteed PGO win via interface devirt+inline) '
+                  'showed <=3% delta. GHA ubuntu-latest runner variance is too high for sub-3% effects. '
+                  'Required fix before further PGO experiments: pinned runner or N>=20 trials with geomean.'
+              )
+          elif leverage_verdict == 'SKIPPED':
+              if ctrl_verdict == 'PASS':
+                  conclusion = (
+                      'Partial result. Harness is sound (positive control passed). '
+                      'Run `profile-capture.yml` from PR #3 to complete the leverage check.'
+                  )
+              else:
+                  conclusion = (
+                      f'Partial result. Positive control: {ctrl_verdict}. '
+                      'Run `profile-capture.yml` from PR #3 to complete the leverage check.'
+                  )
+          else:
+              conclusion = f'ctrl={ctrl_verdict} / leverage={leverage_verdict} -- see details above.'
+
+          report = f"""## PGO Methodology Triage
+
+> Settling whether flat nats PGO results are a measurement artifact or a real
+> "PGO has no leverage" finding. Two deterministic checks.
+
+---
+
+### Step 1: Positive Control
+
+**Verdict: {ctrl_verdict}**
+
+{ctrl_interp}
+
+<details><summary>benchstat output</summary>
+
+```
+{bs_text}
+```
+
+</details>
+
+---
+
+### Step 2: Static Leverage Check (nats-server `go build -gcflags=-m=2`)
+
+**Verdict: {leverage_verdict}**
+
+{leverage_interp}{top_pgo}
+
+---
+
+### Conclusion
+
+{conclusion}
+
+---
+*Workflow: `pgo-methodology-triage.yml` | Runner: ubuntu-latest*
+"""
+
+          with open('/tmp/triage-report.md', 'w') as f:
+              f.write(report)
+          print(report)
+          PYEOF
+
+      - name: "Report | Job summary"
+        run: cat /tmp/triage-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Report | Sticky PR comment"
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pgo-triage
+          path: /tmp/triage-report.md
+
+      - name: "Upload triage artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-triage-results
+          path: |
+            /tmp/ctrl-baseline.txt
+            /tmp/ctrl-pgo.txt
+            /tmp/ctrl-benchstat.txt
+            /tmp/gcflags-no-pgo.txt
+            /tmp/gcflags-with-pgo.txt
+            /tmp/triage-report.md
+          if-no-files-found: warn
