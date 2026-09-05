@@ -1,0 +1,168 @@
+name: PGO Profile Capture and Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  capture-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      # ── CAPTURE: nats bench drives real pub/sub load → pgoctl collects profile ──
+
+      - name: Install NATS CLI
+        run: |
+          go install github.com/nats-io/natscli/nats@latest
+          nats --version
+
+      - name: Build nats-server
+        run: go build -o nats-server .
+
+      - name: Start nats-server with pprof enabled
+        run: |
+          ulimit -n 65536
+          ./nats-server --profile 6060 &
+          NATS_SERVER_PID=$!
+          echo "NATS_SERVER_PID=$NATS_SERVER_PID" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            if nc -z localhost 4222 2>/dev/null; then
+              echo "nats-server ready"
+              break
+            fi
+            sleep 1
+          done
+          nc -z localhost 4222 \
+            || { echo "::error::nats-server did not start in time"; exit 1; }
+
+      - name: Start load via nats bench pub+sub (looped batches, timeout 3360s)
+        run: |
+          ulimit -n 65536
+          # nats bench pre-allocates [][]byte{N} for --msgs N (8 bytes/entry).
+          # Large N values OOM the runner; no --msgs defaults to 100K and exits fast.
+          # Solution: loop with default batches inside timeout 3360s.
+          # The loop-wrapper PID stays alive for the capture window; individual
+          # 100K-msg iterations complete in seconds and restart automatically.
+          #
+          # IMPORTANT: $GITHUB_ENV sets vars for FUTURE steps only, not the current
+          # shell. Must assign $! to a local shell var for same-step kill -0 check.
+          nohup timeout 3360s bash -c '
+            while true; do
+              nats bench sub pgo-load 2>&1 || true
+            done
+          ' > bench-sub.log 2>&1 &
+          NATS_BENCH_SUB_PID=$!
+          echo "NATS_BENCH_SUB_PID=$NATS_BENCH_SUB_PID" >> "$GITHUB_ENV"
+          sleep 2
+          nohup timeout 3360s bash -c '
+            while true; do
+              nats bench pub pgo-load 2>&1 || true
+            done
+          ' > bench-pub.log 2>&1 &
+          NATS_BENCH_PUB_PID=$!
+          echo "NATS_BENCH_PUB_PID=$NATS_BENCH_PUB_PID" >> "$GITHUB_ENV"
+          sleep 3
+          # kill -0 checks the timeout/bash wrapper PID (alive for 3360s)
+          kill -0 "$NATS_BENCH_SUB_PID" 2>/dev/null \
+            || { echo "::error::nats bench sub loop failed to start"; cat bench-sub.log; exit 1; }
+          kill -0 "$NATS_BENCH_PUB_PID" 2>/dev/null \
+            || { echo "::error::nats bench pub loop failed to start"; cat bench-pub.log; exit 1; }
+          echo "nats bench pub+sub loops running (sub=$NATS_BENCH_SUB_PID pub=$NATS_BENCH_PUB_PID)"
+
+      - name: Capture PGO profile via pgoctl (3200s window)
+        id: pgoctl
+        uses: better-go-labs/pgoctl@v0.1.3
+        with:
+          pprof-url: http://localhost:6060
+          duration: 3200
+          timeout-buffer: 160
+          pgoctl-version: v0.1.3
+          artifact-name: default-pgo
+          comment-on-pr: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stop load generators and server
+        if: always()
+        run: |
+          kill "$NATS_BENCH_PUB_PID" 2>/dev/null || true
+          kill "$NATS_BENCH_SUB_PID" 2>/dev/null || true
+          kill "$NATS_SERVER_PID" 2>/dev/null || true
+          echo "=== bench-sub.log ==="
+          cat bench-sub.log 2>/dev/null || echo "(bench-sub.log not found)"
+          echo "=== bench-pub.log ==="
+          cat bench-pub.log 2>/dev/null || echo "(bench-pub.log not found)"
+
+      # ── EVALUATE: baseline vs PGO benchstat ──────────────────────────────────
+
+      - name: Baseline benchmarks (no PGO, n=10)
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark.*Pub.*' \
+            -skip='PubServiceImports|PubSubAccsImport' \
+            -benchmem -count=10 -pgo=off ./test/ | tee baseline.txt
+
+      - name: PGO benchmarks (n=10)
+        run: |
+          ulimit -n 8192
+          go test -run=^$ \
+            -bench='Benchmark.*Pub.*' \
+            -skip='PubServiceImports|PubSubAccsImport' \
+            -benchmem -count=10 \
+            -pgo="${{ steps.pgoctl.outputs.artifact-path }}" \
+            ./test/ | tee pgo.txt
+
+      - name: benchstat comparison
+        run: |
+          benchstat baseline.txt pgo.txt | tee benchstat.txt
+          {
+            echo '### PGO benchstat (no-PGO vs. PGO)'
+            echo '```'
+            cat benchstat.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate PR comment
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## PGO Benchmark — baseline vs PGO"
+            echo ""
+            echo "_n=10, Benchmark.*Pub.* (excl. PubServiceImports, PubSubAccsImport). Signal: ≥2–3% geomean at p<0.05._"
+            echo ""
+            echo '```'
+            cat benchstat.txt
+            echo '```'
+          } > pr-comment.md
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: pgo-benchmark
+          path: pr-comment.md
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          if-no-files-found: warn
+          path: |
+            baseline.txt
+            pgo.txt
+            benchstat.txt
