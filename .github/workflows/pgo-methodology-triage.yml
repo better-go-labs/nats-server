@@ -1,0 +1,145 @@
+name: PGO Methodology Triage
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pgo-triage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  triage:
+    name: "PGO Triage: Positive Control + Static Leverage"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -----------------------------------------------------------------------
+      # STEP 1 - POSITIVE CONTROL
+      # Synthetic benchmark with interface dispatch on one concrete type.
+      # PGO devirtualizes + inlines the hot method, giving a reliable win.
+      # If this control is also flat => harness cannot measure PGO at all.
+      # -----------------------------------------------------------------------
+      - name: "Ctrl | Copy benchmark module"
+        run: cp -r scripts/pgo-triage /tmp/pgo-ctrl
+
+      - name: "Ctrl | Generate CPU profile (15s)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -bench=BenchmarkControl -benchtime=15s -cpuprofile=ctrl.pprof .
+          ls -lh ctrl.pprof
+
+      - name: "Ctrl | Baseline (no PGO, N=10)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -pgo=off -bench=BenchmarkControl -benchtime=3s -count=10 . \
+            | tee /tmp/ctrl-baseline.txt
+          cat /tmp/ctrl-baseline.txt
+
+      - name: "Ctrl | PGO build (with profile, N=10)"
+        working-directory: /tmp/pgo-ctrl
+        run: |
+          go test -pgo=ctrl.pprof -bench=BenchmarkControl -benchtime=3s -count=10 . \
+            | tee /tmp/ctrl-pgo.txt
+          cat /tmp/ctrl-pgo.txt
+
+      - name: "Ctrl | benchstat comparison"
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          benchstat /tmp/ctrl-baseline.txt /tmp/ctrl-pgo.txt | tee /tmp/ctrl-benchstat.txt || true
+          echo "=== benchstat ==="
+          cat /tmp/ctrl-benchstat.txt
+
+      # -----------------------------------------------------------------------
+      # STEP 2 - STATIC LEVERAGE CHECK
+      # go build -gcflags=-m=2 on nats-server with/without profile.
+      # ~0 PGO decisions => no leverage (client.parse over inline budget).
+      # Non-zero => flatness is a measurement problem, not a leverage problem.
+      # -----------------------------------------------------------------------
+      - name: "Leverage | Fetch PGO profile artifact"
+        run: |
+          RUN_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts" \
+            --paginate \
+            --jq '[.artifacts[] | select(.name=="default-pgo" and .expired==false)] | sort_by(.created_at) | last | .workflow_run.id' \
+            2>/dev/null || echo "")
+          if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+            gh run download "$RUN_ID" \
+              --repo "${{ github.repository }}" \
+              --name default-pgo \
+              --dir /tmp/pgo-profile 2>/dev/null || true
+          fi
+          PGO_FILE=$(find /tmp/pgo-profile -type f 2>/dev/null | head -1)
+          if [ -n "$PGO_FILE" ]; then
+            echo "PGO_FILE=$PGO_FILE" >> "$GITHUB_ENV"
+            echo "HAS_PROFILE=true" >> "$GITHUB_ENV"
+            echo "Profile: $PGO_FILE ($(du -sh "$PGO_FILE" | cut -f1))"
+          else
+            echo "HAS_PROFILE=false" >> "$GITHUB_ENV"
+            echo "No default-pgo artifact found - leverage check will run baseline-only side."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Leverage | gcflags -m=2 WITHOUT PGO"
+        run: |
+          go build -pgo=off -gcflags="-m=2" . 2>&1 \
+            | head -c 5242880 > /tmp/gcflags-no-pgo.txt || true
+          echo "Inline decisions (no PGO): $(grep -cE 'can inline|inlining call' /tmp/gcflags-no-pgo.txt || echo 0)"
+          echo "PGO markers    (no PGO):   $(grep -ciE 'devirtuali|pgo.driven|pgo-driven' /tmp/gcflags-no-pgo.txt || echo 0)"
+
+      - name: "Leverage | gcflags -m=2 WITH PGO"
+        run: |
+          if [ "$HAS_PROFILE" = "true" ]; then
+            go build -pgo="$PGO_FILE" -gcflags="-m=2" . 2>&1 \
+              | head -c 5242880 > /tmp/gcflags-with-pgo.txt || true
+            echo "Inline decisions (with PGO): $(grep -cE 'can inline|inlining call' /tmp/gcflags-with-pgo.txt || echo 0)"
+            echo "PGO markers    (with PGO):   $(grep -ciE 'devirtuali|pgo.driven|pgo-driven' /tmp/gcflags-with-pgo.txt || echo 0)"
+          else
+            echo "SKIPPED_NO_PROFILE" > /tmp/gcflags-with-pgo.txt
+            echo "Skipped - no profile available."
+          fi
+
+      # -----------------------------------------------------------------------
+      # REPORT - assemble results, post sticky comment + job summary
+      # -----------------------------------------------------------------------
+      - name: "Report | Generate triage report"
+        env:
+          HAS_PROFILE: ${{ env.HAS_PROFILE }}
+        run: python3 scripts/pgo-triage/report.py
+
+      - name: "Report | Job summary"
+        run: cat /tmp/triage-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Report | Sticky PR comment"
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pgo-triage
+          path: /tmp/triage-report.md
+
+      - name: "Upload triage artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-triage-results
+          path: |
+            /tmp/ctrl-baseline.txt
+            /tmp/ctrl-pgo.txt
+            /tmp/ctrl-benchstat.txt
+            /tmp/gcflags-no-pgo.txt
+            /tmp/gcflags-with-pgo.txt
+            /tmp/triage-report.md
+          if-no-files-found: warn
