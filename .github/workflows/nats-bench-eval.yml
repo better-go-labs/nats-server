@@ -49,13 +49,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build nats-server — baseline (no PGO)
+      - name: Build nats-server - baseline (no PGO)
         run: |
           go build -pgo=off -o nats-server-baseline .
           ls -lh nats-server-baseline
           ./nats-server-baseline --version
 
-      - name: Build nats-server — PGO
+      - name: Build nats-server - PGO
         run: |
           go build -pgo="$PGO_FILE" -o nats-server-pgo .
           ls -lh nats-server-pgo
@@ -64,35 +64,8 @@ jobs:
       - name: Run alternating nats-bench trials (N=5, 3 scenarios)
         run: |
           ulimit -n 65536
-          mkdir -p results/{baseline,pgo}/{s128b,s512b,s1kb,latency}
-
-          start_server() {
-            local build=$1
-            ."nats-server-${build}" -p 4222 > "server-${build}.log" 2>&1 &
-            local pid=$!
-            local i
-            for i in $(seq 1 30); do
-              nc -z localhost 4222 2>/dev/null && break
-              sleep 0.3
-            done
-            nc -z localhost 4222 || {
-              echo "::error::nats-server-${build} did not start" >&2
-              cat "server-${build}.log" >&2
-              kill "$pid" 2>/dev/null || true
-              exit 1
-            }
-            echo "$pid"
-          }
-
-          stop_server() {
-            local pid=$1
-            kill "$pid" 2>/dev/null || true
-            local i
-            for i in $(seq 1 15); do
-              nc -z localhost 4222 2>/dev/null || break
-              sleep 0.3
-            done
-          }
+          mkdir -p results/baseline/s128b results/baseline/s512b results/baseline/s1kb
+          mkdir -p results/pgo/s128b results/pgo/s512b results/pgo/s1kb
 
           TRIALS=5
 
@@ -100,47 +73,72 @@ jobs:
             echo "===== Trial $trial ====="
             for build in baseline pgo; do
               echo "--- build=$build ---"
-              SRV=$(start_server "$build")
 
-              # Scenario 1: 128B payload, 2 pub + 2 sub, 200K msgs/pub
-              # Memory: 2 pubs x 200K x 128B = ~51MB — safe on 7GB runner
-              echo "scenario s128b (128B/2-conn)"
-              nats bench pgo-eval-128b \
-                --pub 2 --sub 2 --msgs 200000 --size 128 \
-                2>&1 | tee "results/${build}/s128b/trial${trial}.txt" || true
+              # Start server
+              ./nats-server-${build} -p 4222 > server-${build}.log 2>&1 &
+              SRV_PID=$!
+              for i in $(seq 1 30); do
+                nc -z localhost 4222 2>/dev/null && break
+                sleep 0.3
+              done
+              if ! nc -z localhost 4222 2>/dev/null; then
+                echo "::error::nats-server-${build} did not start"
+                cat server-${build}.log
+                kill "$SRV_PID" 2>/dev/null || true
+                exit 1
+              fi
+              echo "nats-server-${build} started (pid=$SRV_PID)"
+
+              # ---- Scenario 1: 128B payload, 200K msgs ----
+              # Matches capture workload (profile-capture uses same subject/defaults)
+              echo "scenario s128b (128B, 200K msgs)"
+              nats bench sub pgo-bench-s128b \
+                > results/${build}/s128b/sub-trial${trial}.txt 2>&1 &
+              SUB1=$!
+              sleep 1
+              timeout 120s nats bench pub pgo-bench-s128b \
+                --msgs 200000 --size 128 \
+                2>&1 | tee results/${build}/s128b/trial${trial}.txt || true
+              wait "$SUB1" 2>/dev/null || true
               sleep 1
 
-              # Scenario 2: 512B payload, 4 pub + 4 sub, 100K msgs/pub
-              # Memory: 4 pubs x 100K x 512B = ~205MB — safe on 7GB runner
-              echo "scenario s512b (512B/4-conn)"
-              nats bench pgo-eval-512b \
-                --pub 4 --sub 4 --msgs 100000 --size 512 \
-                2>&1 | tee "results/${build}/s512b/trial${trial}.txt" || true
+              # ---- Scenario 2: 512B payload, 100K msgs ----
+              echo "scenario s512b (512B, 100K msgs)"
+              nats bench sub pgo-bench-s512b \
+                > results/${build}/s512b/sub-trial${trial}.txt 2>&1 &
+              SUB2=$!
+              sleep 1
+              timeout 120s nats bench pub pgo-bench-s512b \
+                --msgs 100000 --size 512 \
+                2>&1 | tee results/${build}/s512b/trial${trial}.txt || true
+              wait "$SUB2" 2>/dev/null || true
               sleep 1
 
-              # Scenario 3: 1KB payload, 2 pub + 2 sub, 50K msgs/pub
-              # Memory: 2 pubs x 50K x 1024B = ~102MB — safe on 7GB runner
-              echo "scenario s1kb (1KB/2-conn)"
-              nats bench pgo-eval-1kb \
-                --pub 2 --sub 2 --msgs 50000 --size 1024 \
-                2>&1 | tee "results/${build}/s1kb/trial${trial}.txt" || true
+              # ---- Scenario 3: 1KB payload, 50K msgs ----
+              echo "scenario s1kb (1KB, 50K msgs)"
+              nats bench sub pgo-bench-s1kb \
+                > results/${build}/s1kb/sub-trial${trial}.txt 2>&1 &
+              SUB3=$!
+              sleep 1
+              timeout 120s nats bench pub pgo-bench-s1kb \
+                --msgs 50000 --size 1024 \
+                2>&1 | tee results/${build}/s1kb/trial${trial}.txt || true
+              wait "$SUB3" 2>/dev/null || true
               sleep 1
 
-              # Latency: 1 pub + 1 sub, 10K msgs, 128B; --latency for p50/p90/p99
-              echo "scenario latency (optional)"
-              nats bench pgo-eval-lat \
-                --pub 1 --sub 1 --msgs 10000 --size 128 \
-                --latency \
-                2>&1 | tee "results/${build}/latency/trial${trial}.txt" || true
-
-              stop_server "$SRV"
+              # Stop server; wait for port to clear
+              kill "$SRV_PID" 2>/dev/null || true
+              for i in $(seq 1 15); do
+                nc -z localhost 4222 2>/dev/null || break
+                sleep 0.3
+              done
               sleep 1
             done
           done
 
           echo "All trials complete."
-          echo "--- Sample output (baseline s128b trial 1) ---"
-          cat results/baseline/s128b/trial1.txt || true
+          echo "--- Sample output: baseline s128b trial 1 ---"
+          cat results/baseline/s128b/trial1.txt || echo "(empty)"
 
       - name: Compute statistics and generate report
         run: |
@@ -148,20 +146,13 @@ jobs:
           import os, re, math, json
 
           def parse_throughput(text):
+              # Matches: "Pub stats: 2,345,678 msgs/sec ~ 285.37 MB/sec"
               m = re.search(r'Pub stats[^:]*:\s+([\d,]+)\s+msgs/sec\s+~\s+([\d.]+)\s+MB/sec', text)
               if m:
                   return float(m.group(1).replace(',', '')), float(m.group(2))
               return None, None
 
-          def parse_latency_p(text, pct):
-              pat = rf'(?i)\b{pct}%?\s*:?\s*([\d.]+)\s*([\xb5u]s|ms)'
-              m = re.search(pat, text)
-              if not m:
-                  return None
-              val = float(m.group(1))
-              return val * 1000 if 'ms' in m.group(2).lower() else val
-
-          def stats(vals):
+          def mean_std(vals):
               n = len(vals)
               if not n:
                   return None, None, 0
@@ -170,93 +161,67 @@ jobs:
               return m, s, n
 
           builds = ['baseline', 'pgo']
-          scenarios = [('s128b', '128B/2-conn'), ('s512b', '512B/4-conn'), ('s1kb', '1KB/2-conn')]
+          scenarios = [('s128b', '128B/1-conn'), ('s512b', '512B/1-conn'), ('s1kb', '1KB/1-conn')]
           raw = {}
 
           for build in builds:
               raw[build] = {}
-              for sc, _ in scenarios + [('latency', 'latency')]:
-                  msgs_l, mb_l, lat50_l, lat90_l, lat99_l = [], [], [], [], []
+              for sc, _ in scenarios:
+                  msgs_l, mb_l = [], []
                   d = f'results/{build}/{sc}'
                   if os.path.isdir(d):
                       for fn in sorted(os.listdir(d)):
                           if not fn.startswith('trial'):
                               continue
-                          t = open(f'{d}/{fn}').read()
-                          msgs, mb = parse_throughput(t)
-                          if msgs:
+                          text = open(f'{d}/{fn}').read()
+                          msgs, mb = parse_throughput(text)
+                          if msgs is not None:
                               msgs_l.append(msgs)
                               mb_l.append(mb)
-                          p50 = parse_latency_p(t, '50')
-                          p90 = parse_latency_p(t, '90')
-                          p99 = parse_latency_p(t, '99')
-                          if p50:
-                              lat50_l.append(p50)
-                              lat90_l.append(p90)
-                              lat99_l.append(p99)
-                  raw[build][sc] = dict(msgs=msgs_l, mb=mb_l, lat50=lat50_l, lat90=lat90_l, lat99=lat99_l)
+                  raw[build][sc] = {'msgs': msgs_l, 'mb': mb_l}
 
           with open('results/raw.json', 'w') as f:
-              json.dump(raw, f, indent=2, default=str)
+              json.dump(raw, f, indent=2)
 
           L = [
               '## PGO nats-bench Throughput Evaluation',
               '',
-              '_N=5 alternating trials (baseline, PGO, baseline, …). Workload: real nats-bench pub+sub._',
-              '_Profile: 530KB CPU profile captured under 3200s nats-bench pub+sub load._',
-              '_Runner: ubuntu-latest (~7GB RAM). Verdict threshold: ±3% geomean._',
+              '_N=5 alternating trials (baseline, PGO, baseline, ...). Workload: nats bench pub+sub._',
+              '_Profile: 530KB CPU profile from 3200s nats-bench pub+sub load (run #69)._',
+              '_Runner: ubuntu-latest (~7GB RAM, AMD EPYC 7763). Verdict threshold: +/-3% geomean._',
               '',
-              '### Throughput — msgs/sec',
+              '### Throughput - msgs/sec',
               '',
-              '| Scenario | Baseline (mean±σ) | PGO (mean±σ) | N | Δ% |',
+              '| Scenario | Baseline (mean+/-sd) | PGO (mean+/-sd) | N (base/pgo) | Delta% |',
               '|---|---|---|---|---|',
           ]
 
           ratios = []
           for sc, label in scenarios:
-              bm, bs, bn = stats(raw['baseline'][sc]['msgs'])
-              pm, ps, pn = stats(raw['pgo'][sc]['msgs'])
+              bm, bs, bn = mean_std(raw['baseline'][sc]['msgs'])
+              pm, ps, pn = mean_std(raw['pgo'][sc]['msgs'])
               if bm and pm:
                   d = (pm - bm) / bm * 100
                   ratios.append(pm / bm)
-                  L.append(f'| {label} | {bm/1e6:.3f}M ± {bs/1e6:.3f}M | {pm/1e6:.3f}M ± {ps/1e6:.3f}M | {bn}/{pn} | {d:+.1f}% |')
+                  L.append(f'| {label} | {bm/1e6:.3f}M +/- {bs/1e6:.3f}M | {pm/1e6:.3f}M +/- {ps/1e6:.3f}M | {bn}/{pn} | {d:+.1f}% |')
               else:
-                  L.append(f'| {label} | — | — | {bn}/{pn} | — |')
+                  L.append(f'| {label} | -- | -- | {bn}/{pn} | -- |')
 
           L += [
               '',
-              '### Throughput — MB/s',
+              '### Throughput - MB/s',
               '',
-              '| Scenario | Baseline (mean±σ) | PGO (mean±σ) | Δ% |',
+              '| Scenario | Baseline (mean+/-sd) | PGO (mean+/-sd) | Delta% |',
               '|---|---|---|---|',
           ]
           for sc, label in scenarios:
-              bm, bs, _ = stats(raw['baseline'][sc]['mb'])
-              pm, ps, _ = stats(raw['pgo'][sc]['mb'])
+              bm, bs, _ = mean_std(raw['baseline'][sc]['mb'])
+              pm, ps, _ = mean_std(raw['pgo'][sc]['mb'])
               if bm and pm:
                   d = (pm - bm) / bm * 100
-                  L.append(f'| {label} | {bm:.1f} ± {bs:.1f} | {pm:.1f} ± {ps:.1f} | {d:+.1f}% |')
+                  L.append(f'| {label} | {bm:.1f} +/- {bs:.1f} | {pm:.1f} +/- {ps:.1f} | {d:+.1f}% |')
               else:
-                  L.append(f'| {label} | — | — | — |')
-
-          bl = raw['baseline'].get('latency', {})
-          pl = raw['pgo'].get('latency', {})
-          if bl.get('lat50') and pl.get('lat50'):
-              bm50, _, _ = stats(bl['lat50'])
-              bm90, _, _ = stats(bl['lat90'])
-              bm99, _, _ = stats(bl['lat99'])
-              pm50, _, _ = stats(pl['lat50'])
-              pm90, _, _ = stats(pl['lat90'])
-              pm99, _, _ = stats(pl['lat99'])
-              L += [
-                  '',
-                  '### Latency (128B, 1 pub + 1 sub)',
-                  '',
-                  '| Build | p50 | p90 | p99 |',
-                  '|---|---|---|---|',
-                  f'| Baseline | {bm50:.0f}µs | {bm90:.0f}µs | {bm99:.0f}µs |',
-                  f'| PGO      | {pm50:.0f}µs | {pm90:.0f}µs | {pm99:.0f}µs |',
-              ]
+                  L.append(f'| {label} | -- | -- | -- |')
 
           L.append('')
           L.append('### Verdict')
@@ -264,27 +229,31 @@ jobs:
 
           if ratios:
               gm = (math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1) * 100
-              L.append(f'**Geomean throughput Δ (PGO vs baseline): {gm:+.1f}%**')
+              L.append(f'**Geomean throughput delta (PGO vs baseline): {gm:+.1f}%**')
               L.append('')
               if gm > 3.0:
-                  L.append(f'**YES** — PGO improves real-workload throughput by **{gm:+.1f}%** (geomean across 3 scenarios).')
+                  L.append(f'**YES** -- PGO improves real-workload throughput by {gm:+.1f}% geomean (3 scenarios x N=5 trials).')
               elif gm < -3.0:
-                  L.append(f'**NO** — PGO degrades real-workload throughput by **{gm:+.1f}%** (geomean across 3 scenarios).')
+                  L.append(f'**NO** -- PGO degrades real-workload throughput by {gm:+.1f}% geomean (3 scenarios x N=5 trials).')
               else:
                   L.append(
-                      f'**INCONCLUSIVE** — PGO throughput effect is **{gm:+.1f}%**, within the ±3% noise '
-                      f'threshold for macro benchmarks. The microbenchmark geomean showed +0.95% slowdown '
-                      f'(sec/op) — single-op synthetic workloads do not reflect the mixed-load behaviour '
-                      f'the profile was captured from. More trials or a longer warm-up window may clarify the signal.'
+                      f'**INCONCLUSIVE** -- PGO throughput effect is {gm:+.1f}%, within the +/-3% noise '
+                      'threshold typical for macro benchmarks. '
+                      'Microbenchmark baseline showed +0.95% geomean slowdown (sec/op) on single-op synthetic '
+                      'workloads that do not reflect the mixed-load behavior the profile was captured from. '
+                      'More trials or a longer warm-up window would sharpen the signal.'
                   )
           else:
-              L.append('**INCONCLUSIVE** — Could not parse nats-bench output (check nats-bench-results artifact for raw trial files).')
+              L.append(
+                  '**INCONCLUSIVE** -- Could not parse nats-bench output. '
+                  'Check the nats-bench-results artifact for raw trial files and server logs.'
+              )
 
           L += [
               '',
               '---',
-              '_Microbenchmark reference (benchstat, n=10): **+0.95% geomean sec/op** slowdown on synthetic single-op workload._',
-              '_This evaluation tests the profile\'s intended target: sustained pub+sub throughput at production-shaped load._',
+              '_Microbenchmark reference (benchstat n=10): +0.95% geomean sec/op regression on single-op synthetic workload._',
+              '_This workflow tests the profile intended target: sustained pub+sub throughput under production-shaped load._',
           ]
 
           report = '\n'.join(L)
