@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: nats-bench-eval-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -27,6 +31,7 @@ jobs:
         run: |
           go install github.com/nats-io/natscli/nats@latest
           nats --version
+          nats bench --help 2>&1 | head -20 || true
 
       - name: Download PGO profile (latest captured artifact)
         run: |
@@ -67,6 +72,12 @@ jobs:
           mkdir -p results/baseline/s128b results/baseline/s512b results/baseline/s1kb
           mkdir -p results/pgo/s128b results/pgo/s512b results/pgo/s1kb
 
+          # Scenarios: name:pub:sub:msgs:size
+          # Memory per scenario: pubs x msgs x size (all well below 7GB runner limit)
+          #   s128b: 2 pubs x 200K x 128B = ~51MB
+          #   s512b: 4 pubs x 100K x 512B = ~205MB
+          #   s1kb:  2 pubs x 50K  x 1KB  = ~102MB
+          SCENARIOS="s128b:2:2:200000:128 s512b:4:4:100000:512 s1kb:2:2:50000:1024"
           TRIALS=5
 
           for trial in $(seq 1 $TRIALS); do
@@ -89,44 +100,21 @@ jobs:
               fi
               echo "nats-server-${build} started (pid=$SRV_PID)"
 
-              # ---- Scenario 1: 128B payload, 200K msgs ----
-              # Matches capture workload (profile-capture uses same subject/defaults)
-              echo "scenario s128b (128B, 200K msgs)"
-              nats bench sub pgo-bench-s128b \
-                > results/${build}/s128b/sub-trial${trial}.txt 2>&1 &
-              SUB1=$!
-              sleep 1
-              timeout 120s nats bench pub pgo-bench-s128b \
-                --msgs 200000 --size 128 \
-                2>&1 | tee results/${build}/s128b/trial${trial}.txt || true
-              wait "$SUB1" 2>/dev/null || true
-              sleep 1
+              for sc_def in $SCENARIOS; do
+                IFS=: read -r sc pubs subs msgs size <<< "$sc_def"
+                subject="pgo-bench-${sc}"
+                echo "scenario $sc (pub=$pubs sub=$subs msgs=$msgs size=${size}B)"
+                # Integrated form: nats bench handles pub+sub lifecycle and
+                # tears down cleanly once all messages are delivered.
+                # Both --pub and --sub goroutines exit after msgs are sent/received.
+                timeout 120s nats bench "$subject" \
+                  --pub "$pubs" --sub "$subs" \
+                  --msgs "$msgs" --size "$size" \
+                  2>&1 | tee "results/${build}/${sc}/trial${trial}.txt" || true
+                sleep 1
+              done
 
-              # ---- Scenario 2: 512B payload, 100K msgs ----
-              echo "scenario s512b (512B, 100K msgs)"
-              nats bench sub pgo-bench-s512b \
-                > results/${build}/s512b/sub-trial${trial}.txt 2>&1 &
-              SUB2=$!
-              sleep 1
-              timeout 120s nats bench pub pgo-bench-s512b \
-                --msgs 100000 --size 512 \
-                2>&1 | tee results/${build}/s512b/trial${trial}.txt || true
-              wait "$SUB2" 2>/dev/null || true
-              sleep 1
-
-              # ---- Scenario 3: 1KB payload, 50K msgs ----
-              echo "scenario s1kb (1KB, 50K msgs)"
-              nats bench sub pgo-bench-s1kb \
-                > results/${build}/s1kb/sub-trial${trial}.txt 2>&1 &
-              SUB3=$!
-              sleep 1
-              timeout 120s nats bench pub pgo-bench-s1kb \
-                --msgs 50000 --size 1024 \
-                2>&1 | tee results/${build}/s1kb/trial${trial}.txt || true
-              wait "$SUB3" 2>/dev/null || true
-              sleep 1
-
-              # Stop server; wait for port to clear
+              # Stop server and wait for port to clear
               kill "$SRV_PID" 2>/dev/null || true
               for i in $(seq 1 15); do
                 nc -z localhost 4222 2>/dev/null || break
@@ -161,7 +149,7 @@ jobs:
               return m, s, n
 
           builds = ['baseline', 'pgo']
-          scenarios = [('s128b', '128B/1-conn'), ('s512b', '512B/1-conn'), ('s1kb', '1KB/1-conn')]
+          scenarios = [('s128b', '128B/2-conn'), ('s512b', '512B/4-conn'), ('s1kb', '1KB/2-conn')]
           raw = {}
 
           for build in builds:
@@ -186,7 +174,7 @@ jobs:
           L = [
               '## PGO nats-bench Throughput Evaluation',
               '',
-              '_N=5 alternating trials (baseline, PGO, baseline, ...). Workload: nats bench pub+sub._',
+              '_N=5 alternating trials (baseline, PGO, baseline, ...). Workload: nats bench integrated pub+sub._',
               '_Profile: 530KB CPU profile from 3200s nats-bench pub+sub load (run #69)._',
               '_Runner: ubuntu-latest (~7GB RAM, AMD EPYC 7763). Verdict threshold: +/-3% geomean._',
               '',
